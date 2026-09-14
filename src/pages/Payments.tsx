@@ -65,21 +65,8 @@ export default function Payments() {
   const [groupFilter, setGroupFilter] = useState<GroupType | "all">("all");
   const [activeTab, setActiveTab] = useState("ruleA");
   const [smallGroupSubject, setSmallGroupSubject] = useState<Subject>("Math");
-  const [smallGroupView, setSmallGroupView] = useState<"cards" | "table">(() => {
-    if (typeof window === "undefined") return "cards";
-    const v = localStorage.getItem("ennajd-smallGroupView");
-    return v === "table" ? "table" : "cards";
-  });
+  const [smallGroupView, setSmallGroupView] = useState<"cards" | "table">("cards");
   const [tablesOpen, setTablesOpen] = useState(true);
-
-  function persistView(v: "cards" | "table") {
-    setSmallGroupView(v);
-    try {
-      localStorage.setItem("ennajd-smallGroupView", v);
-    } catch {
-      // ignore
-    }
-  }
 
   // Taxonomy-gated visibility for the Level → Track → Subject → Group chain.
   const showTrackFilter =
@@ -395,12 +382,12 @@ export default function Payments() {
             })}
           </ToggleGroup>
 
-          {/* View switcher — persists in localStorage */}
+          {/* View switcher */}
           <div className="flex items-center gap-2">
             <div className="inline-flex rounded-full bg-muted p-1">
               <button
                 type="button"
-                onClick={() => persistView("cards")}
+                onClick={() => setSmallGroupView("cards")}
                 className={
                   smallGroupView === "cards"
                     ? "inline-flex items-center gap-1.5 rounded-full bg-card px-3.5 py-1.5 text-xs font-semibold shadow-sm"
@@ -412,7 +399,7 @@ export default function Payments() {
               </button>
               <button
                 type="button"
-                onClick={() => persistView("table")}
+                onClick={() => setSmallGroupView("table")}
                 className={
                   smallGroupView === "table"
                     ? "inline-flex items-center gap-1.5 rounded-full bg-card px-3.5 py-1.5 text-xs font-semibold shadow-sm"

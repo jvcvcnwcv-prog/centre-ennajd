@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import type { User } from "@supabase/supabase-js";
 
-// Map Supabase auth error codes/messages to the Firebase-compatible codes
+// Map Supabase auth error codes to the Firebase-compatible codes
 // that LoginPage.tsx's i18n table already understands.
 function mapSupabaseError(
   err: { message?: string; code?: string },

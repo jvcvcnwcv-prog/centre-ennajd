@@ -5,13 +5,10 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
 import { AppShell } from "@/components/layout/AppShell";
-import { AuthGate } from "@/components/auth/AuthGate";
-import { useAuthUser } from "@/lib/auth-client";
 import NotFound from "./pages/NotFound";
-import LoginPage from "./pages/auth/LoginPage";
 
 // Admin-only page stays lazy (rarely visited) — it keeps its own
 // Suspense boundary below.
@@ -20,8 +17,8 @@ const SeedDemoData = lazy(() => import("./pages/admin/SeedDemoData"));
 const queryClient = new QueryClient();
 
 // Code-split the large page bundles so navigating only parses/executes that
-// page's JS instead of the single eagerly-loaded bundle. LoginPage and
-// NotFound stay eager (small, always needed).
+// page's JS instead of the single eagerly-loaded bundle. NotFound stays eager
+// (small, always needed).
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Students = lazy(() => import("./pages/Students"));
 const Sessions = lazy(() => import("./pages/Sessions"));
@@ -38,13 +35,6 @@ function PageLoader() {
   );
 }
 
-function LoginRoute() {
-  const { user, loading } = useAuthUser();
-  if (loading) return null;
-  if (user) return <Navigate to="/" replace />;
-  return <LoginPage />;
-}
-
 const App = () => (
   <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false}>
     <QueryClientProvider client={queryClient}>
@@ -53,17 +43,14 @@ const App = () => (
         <Sonner />
         <BrowserRouter>
           <Routes>
-            <Route path="/login" element={<LoginRoute />} />
-            <Route element={<AuthGate />}>
-              <Route element={<AppShell />}>
-                <Route path="/" element={<Dashboard />} />
-                <Route path="/students" element={<Students />} />
-                <Route path="/sessions" element={<Sessions />} />
-                <Route path="/messages" element={<Messages />} />
-                <Route path="/pricing" element={<Pricing />} />
-                <Route path="/payments" element={<Payments />} />
-                <Route path="/reports" element={<Reports />} />
-              </Route>
+            <Route element={<AppShell />}>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/students" element={<Students />} />
+              <Route path="/sessions" element={<Sessions />} />
+              <Route path="/messages" element={<Messages />} />
+              <Route path="/pricing" element={<Pricing />} />
+              <Route path="/payments" element={<Payments />} />
+              <Route path="/reports" element={<Reports />} />
               <Route
                 path="/admin/seed"
                 element={

@@ -3,6 +3,7 @@ import {
   FileDown,
   GraduationCap,
   LayoutDashboard,
+  LogOut,
   MessageSquare,
   Receipt,
   Settings,
@@ -15,6 +16,7 @@ import { NavLink, Outlet } from "react-router-dom";
 import { LanguageToggle } from "@/components/layout/LanguageToggle";
 import { NotificationBell } from "@/components/layout/NotificationBell";
 import { ThemeToggle } from "@/components/layout/ThemeToggle";
+import { useAuthUser } from "@/lib/auth-client";
 import { useFirestoreSync } from "@/lib/ennajd-firestore-sync";
 import {
   Sidebar,
@@ -31,6 +33,8 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
+import { signOutUser } from "@/lib/auth-client";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -80,10 +84,24 @@ function ConnectionBadge() {
 
 export function AppShell() {
   const { t, lang } = useI18n();
+  const { user } = useAuthUser();
   const navItems = useNavItems();
 
-  // Sync Supabase data continuously
+  // Sync Supabase data once after authentication
   useFirestoreSync();
+
+  // Preload all lazy-loaded pages after authentication
+  useEffect(() => {
+    if (user) {
+      import("@/pages/Dashboard");
+      import("@/pages/Students");
+      import("@/pages/Sessions");
+      import("@/pages/Messages");
+      import("@/pages/Pricing");
+      import("@/pages/Payments");
+      import("@/pages/Reports");
+    }
+  }, [user]);
 
   return (
     <SidebarProvider>
@@ -153,15 +171,25 @@ export function AppShell() {
       </Sidebar>
       <SidebarInset>
         <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-border bg-background/80 px-3 backdrop-blur-sm sm:px-6">
-          <SidebarTrigger className="text-foreground" />
-          <div className="flex-1" />
-          <ConnectionBadge />
-          <NotificationBell />
-          <LanguageToggle />
-          <ThemeToggle />
-        </header>
+                  <SidebarTrigger className="text-foreground" />
+                  <div className="flex-1" />
+                  <ConnectionBadge />
+                  <NotificationBell />
+                  <LanguageToggle />
+                  <ThemeToggle />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="rounded-full"
+                    onClick={() => void signOutUser()}
+                    aria-label={lang === "ar" ? "تسجيل الخروج" : "Se déconnecter"}
+                    title={lang === "ar" ? "تسجيل الخروج" : "Se déconnecter"}
+                  >
+                    <LogOut className="h-4 w-4" />
+                  </Button>
+                </header>
         <main className="flex-1 p-4 sm:p-6">
-          {/* Pages are preloaded right after sign-in, so this boundary only
+          {/* Pages are preloaded after authentication, so this boundary only
               suspends on the brief cold-start first visit — hence the null
               fallback (no spinner flash between routes). */}
           <Suspense fallback={null}>

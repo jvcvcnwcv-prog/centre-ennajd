@@ -368,6 +368,19 @@ const dictionary = {
     confirmDateChange: "Changer la date de la première séance va recalculer toutes les échéances — confirmer ?",
     popoversScopeNote:
       "Le règlement partiel et le crayon s'appliquent à toutes les échéances dues de la matière (même logique que le portefeuille) — pas seulement à ce mois.",
+    tuitionCardTitle: "Mensualité",
+    tuitionTotalLabel: "Total défini (auto)",
+    tuitionPaidLabel: "Montant payé",
+    tuitionPaidPlaceholder: "Ex. 500",
+    tuitionRemainingWillBe: "Reste (calculé)",
+    tuitionPerSubjectBreakdown: "Détail par matière",
+    tuitionPaidExceedsTotal: "Le montant payé ne peut pas dépasser le total.",
+    invalidTuitionPaid: "Le montant payé doit être un entier entre 0 et le total.",
+    noPriceDefined: "Aucun tarif défini pour cette combinaison.",
+    initialTuitionPaymentRecorded: "Paiement initial enregistré",
+    paymentSaveFailed: "Échec de l'enregistrement du paiement",
+    paymentSaveFailedHint:
+      "Le paiement n'a pas pu être enregistré. Vos modifications locales ont été annulées — réessayez.",
   },
   ar: {
     appName: "مركز النجد",
@@ -721,6 +734,19 @@ const dictionary = {
     confirmDateChange: "تغيير تاريخ أول حصة سيعيد حساب كل الاستحقاقات — هل أنت متأكد؟",
     popoversScopeNote:
       "الدفعة الجزئية والقلم يشتغلان على كل الأقساط المستحقة للمادة (نفس منطق المحفظة) — ليس شهراً واحداً فقط.",
+    tuitionCardTitle: "المدفوعات الشهرية",
+    tuitionTotalLabel: "المجموع (تلقائي)",
+    tuitionPaidLabel: "المبلغ المدفوع",
+    tuitionPaidPlaceholder: "مثال 500",
+    tuitionRemainingWillBe: "المتبقي (محسوب)",
+    tuitionPerSubjectBreakdown: "التفصيل حسب المادة",
+    tuitionPaidExceedsTotal: "لا يمكن أن يتجاوز المبلغ المدفوع المجموع.",
+    invalidTuitionPaid: "يجب أن يكون المبلغ المدفوع عدداً صحيحاً بين 0 والمجموع.",
+    noPriceDefined: "لا يوجد سعر محدد لهذه المجموعة.",
+    initialTuitionPaymentRecorded: "تم تسجيل الدفعة الأولية",
+    paymentSaveFailed: "فشل حفظ الدفع",
+    paymentSaveFailedHint:
+      "تعذر حفظ الدفع. تم إلغاء التغييرات المحلية — حاول مرة أخرى.",
   },
 } satisfies Record<LangCode, Record<string, string>>;
 

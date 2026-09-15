@@ -328,41 +328,42 @@ export function setPaymentPaidDoc(
   updatedAt: string,
 ): Promise<void> {
   return wrapSupabaseVoid(
-    supabase.from("payments").upsert({
-      id,
-      is_paid: isPaid,
-      updated_at: updatedAt,
-    } as never),
+    supabase
+      .from("payments")
+      .update({ is_paid: isPaid, updated_at: updatedAt } as never)
+      .eq("id", id),
   );
 }
 
 /**
  * Batch patch for amountPaid/isPaid — used by recordPartialPayment which
  * may spill over into the next installment in a single atomic commit.
+ *
+ * Uses an explicit per-id `update(...).eq("id", id)` per row rather than
+ * `upsert`, so a patch can never silently INSERT a partial row (which would
+ * trip the NOT NULL / check constraints on amount_due). Each row is patched
+ * only by primary key, preserving amount_due / due_date / rule untouched.
+ * Chunks at BATCH_CHUNK_SIZE (450) to keep payloads reasonable.
  */
 export async function updatePaymentsBatchDoc(
   patches: Array<Pick<Payment, "id"> & Partial<Payment>>,
 ): Promise<void> {
   for (let i = 0; i < patches.length; i += BATCH_CHUNK_SIZE) {
     const chunk = patches.slice(i, i + BATCH_CHUNK_SIZE);
-    const rows: Record<string, unknown>[] = chunk.map((patch) => {
+    for (const patch of chunk) {
       const { id, ...fields } = patch;
-      const row: Record<string, unknown> = {
-        id,
-        is_paid: fields.isPaid,
-        amount_paid: fields.amountPaid,
-        updated_at: fields.updatedAt,
-      };
-      const cleanRow: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(row)) {
-        if (value !== undefined) {
-          cleanRow[key] = value;
-        }
+      const updates: Record<string, unknown> = { updated_at: fields.updatedAt };
+      if (fields.isPaid !== undefined) updates.is_paid = fields.isPaid;
+      if (fields.amountPaid !== undefined) {
+        updates.amount_paid = Math.max(0, Math.round(fields.amountPaid));
       }
-      return cleanRow;
-    });
-    const { error } = await supabase.from("payments").upsert(rows as never[]);
-    assertNoError(error);
+      if (Object.keys(updates).length <= 1) continue; // nothing to patch besides ts
+      const { error } = await supabase
+        .from("payments")
+        .update(updates as never)
+        .eq("id", id);
+      assertNoError(error);
+    }
   }
 }
 

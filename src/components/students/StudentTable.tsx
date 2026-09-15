@@ -35,7 +35,7 @@ import { StudentReceiptDialog } from "@/components/reports/StudentReceiptDialog"
 import { RegistrationFeeBadge } from "@/components/payments/RegistrationFeeBadge";
 import { SettleStudentDialog } from "@/components/students/SettleStudentDialog";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
-import { formatDateKey, getPaymentRemaining } from "@/lib/ennajd-billing";
+import { formatDateKey, getPaymentRemaining, isPaymentFullyPaid } from "@/lib/ennajd-billing";
 import { isGroupTypeApplicable } from "@/lib/ennajd-taxonomy";
 import { useI18n } from "@/lib/i18n";
 import { getPageNumbers } from "@/lib/pagination";
@@ -201,13 +201,16 @@ export function StudentTable({ students, onEdit, emptyState }: StudentTableProps
       const entry = map.get(payment.studentId) ?? { count: 0, remaining: 0 };
       entry.count += 1;
       // Explicit future exclusion: only past-due installments count toward Reste
-      if (payment.dueDate <= todayKey) {
-        // Only unpaid installments contribute; getPaymentRemaining is partial-aware
-        if (!payment.isPaid) {
-          const remaining = getPaymentRemaining(payment);
-          if (remaining > 0) entry.remaining += remaining;
-        }
-      }
+            // Use isPaymentFullyPaid for consistency with aggregateOverdueInstallments /
+            // getDueBalanceForStudentSubject — an installment counts as owed only when
+            // neither the isPaid flag nor amountPaid covers amountDue.
+            if (payment.dueDate <= todayKey) {
+              // Only unpaid installments contribute; getPaymentRemaining is partial-aware
+              if (!isPaymentFullyPaid(payment)) {
+                const remaining = getPaymentRemaining(payment);
+                if (remaining > 0) entry.remaining += remaining;
+              }
+            }
       map.set(payment.studentId, entry);
     }
     return map;

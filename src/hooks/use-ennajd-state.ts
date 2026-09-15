@@ -10,6 +10,7 @@
 // offline queue flushing).
 
 import { create } from "zustand";
+import { toast } from "sonner";
 import {
   buildDeliveredDatesContext,
   dedupePayments,
@@ -17,6 +18,8 @@ import {
   formatMonthKey,
   generateScheduleFor,
   getPaymentRuleFor,
+  isPaymentFullyPaid,
+  getPaymentRemaining,
   REGISTRATION_FEE_DEFAULT,
   type DeliveredDatesContext,
 } from "@/lib/ennajd-billing";
@@ -109,19 +112,24 @@ interface EnnajdState {
   sweepExpiredOneOffSessions: (now: Date) => number;
 
   syncPayments: (now: Date) => void;
-  setPaymentPaid: (paymentId: string, isPaid: boolean) => void;
+  setPaymentPaid: (paymentId: string, isPaid: boolean) => Promise<void>;
   recordPartialPayment: (
     studentId: string,
     subject: Subject,
     amount: number,
     asOf: Date,
-  ) => void;
+  ) => Promise<void>;
   adjustStudentSubjectBalance: (
     studentId: string,
     subject: Subject,
     targetRemaining: number,
     asOf: Date,
-  ) => void;
+  ) => Promise<void>;
+  applyInitialTuitionPayment: (
+    studentId: string,
+    totalPaid: number,
+    asOf: Date,
+  ) => Promise<void>;
   setSubjectPaymentNote: (
     studentId: string,
     subject: Subject,
@@ -155,6 +163,36 @@ interface EnnajdState {
 
 function makeId(): string {
   return crypto.randomUUID();
+}
+
+/**
+ * Pure helper — computes the total tuition (MAD) for a set of enrollments
+ * WITHOUT requiring a persisted student.id (used at creation time, before the
+ * student doc exists). Mirrors `getEffectivePrice` + `getBasePrice`:
+ * `customPrice ?? base price` per enrollment. Returns 0 when no price is
+ * defined for any enrollment (the caller disables the Paid input in that case).
+ */
+export function computeTuitionTotal(
+  enrollments: SubjectEnrollment[],
+  level: Level,
+  prices: PriceEntry[],
+): number {
+  let total = 0;
+  for (const enrollment of enrollments) {
+    if (enrollment.customPrice !== undefined) {
+      total += enrollment.customPrice;
+      continue;
+    }
+    const base = prices.find(
+      (p) =>
+        p.level === level &&
+        p.subject === enrollment.subject &&
+        p.track === enrollment.track &&
+        p.groupType === enrollment.groupType,
+    )?.price;
+    if (base !== undefined) total += base;
+  }
+  return total;
 }
 
 /**
@@ -579,17 +617,23 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     }
   },
 
-  setPaymentPaid: (paymentId, isPaid) => {
+  setPaymentPaid: async (paymentId, isPaid) => {
     const updatedAt = new Date().toISOString();
+    const previous = get().payments;
     set((state) => ({
       payments: state.payments.map((p) =>
         p.id === paymentId ? { ...p, isPaid, updatedAt } : p,
       ),
     }));
-    void setPaymentPaidDoc(paymentId, isPaid, updatedAt);
+    try {
+      await setPaymentPaidDoc(paymentId, isPaid, updatedAt);
+    } catch (err) {
+      set({ payments: previous });
+      toast.error("Échec de l'enregistrement du paiement");
+    }
   },
 
-  recordPartialPayment: (studentId, subject, amount, asOf) => {
+  recordPartialPayment: async (studentId, subject, amount, asOf) => {
   if (!(amount > 0)) return;
   const asOfKey = formatDateKey(asOf);
   const updatedAt = new Date().toISOString();
@@ -628,10 +672,16 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   if (patches.length === 0) return;
 
   const nextById = new Map(nextPayments.map((p) => [p.id, p]));
+  const previous = get().payments;
   set((state) => ({
     payments: state.payments.map((p) => nextById.get(p.id) ?? p),
   }));
-  void updatePaymentsBatchDoc(patches);
+  try {
+    await updatePaymentsBatchDoc(patches);
+  } catch (err) {
+    set({ payments: previous });
+    toast.error("Échec de l'enregistrement du paiement");
+  }
 },
 
 /**
@@ -652,7 +702,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
  * (flag first, then paid credit), optionally retaining partial credit, to
  * land exactly on the target. All patches ship in ONE batch commit.
  */
-adjustStudentSubjectBalance: (studentId, subject, targetRemaining, asOf) => {
+adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) => {
   if (!Number.isFinite(targetRemaining) || targetRemaining < 0) return;
   const asOfKey = formatDateKey(asOf);
   const updatedAt = new Date().toISOString();
@@ -722,10 +772,164 @@ adjustStudentSubjectBalance: (studentId, subject, targetRemaining, asOf) => {
   if (patches.length === 0) return;
 
   const nextById = new Map(nextPayments.map((p) => [p.id, p]));
+  const previous = get().payments;
   set((state) => ({
     payments: state.payments.map((p) => nextById.get(p.id) ?? p),
   }));
-  void updatePaymentsBatchDoc(patches);
+  try {
+    await updatePaymentsBatchDoc(patches);
+  } catch (err) {
+    set({ payments: previous });
+    toast.error("Échec de l'enregistrement du paiement");
+  }
+},
+
+/**
+ * Create-time tuition payment — called by `StudentFormSheet` right after a new
+ * student is created. Distributes `totalPaid` across ALL of the student's
+ * subjects in a single earliest-due-first waterfall (same ordering as
+ * `recordPartialPayment`: dueDate then subject locale), only crediting
+ * installments that are already due (dueDate <= asOfKey — the Reste guard),
+ * never future auto-generated months.
+ *
+ * This is a cross-subject generalization of `recordPartialPayment`: instead
+ * of filtering to one subject, it scans every subject of the student, so a
+ * single credit can spill from a Math installment into a PC installment when
+ * the first subject's due installments are exhausted.
+ *
+ * Optimistic local update (snapshot + rollback on failure), then a single
+ * `updatePaymentsBatchDoc` commit. On failure the caller (StudentFormSheet)
+ * stays open; the error toast is fired here and the local snapshot reverted.
+ */
+applyInitialTuitionPayment: async (studentId, totalPaid, asOf) => {
+  const asOfKey = formatDateKey(asOf);
+  const updatedAt = new Date().toISOString();
+
+  if (!Number.isFinite(totalPaid) || totalPaid <= 0) return;
+
+  // Ensure installments exist for this student before distributing credit.
+  // `syncPayments` is throttled to once/day + once/min and may not have run
+  // yet for the just-created student (the realtime echo is async). Generate
+  // inline for this student only — `syncPayments`' `existingKeys` dedupe
+  // means these rows are skipped on the next full sync, and `hydratePayments`
+  // + `dedupePayments` collapse any realtime duplicates.
+  const state = get();
+  const student = state.students.find((s) => s.id === studentId);
+  if (!student) return;
+
+  const existingKeys = new Set(
+    state.payments
+      .filter((p) => p.studentId === studentId)
+      .map((p) => `${p.subject}__${p.dueDate}`),
+  );
+  const generated: Payment[] = [];
+  {
+    const ctxCache = new Map<string, DeliveredDatesContext>();
+    for (const enrollment of student.enrollments) {
+      const rule = getPaymentRuleFor(
+        student.level,
+        enrollment.subject,
+        enrollment.groupType,
+        enrollment.track,
+      );
+      const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+      const fullPrice = get().getEffectivePrice(studentId, enrollment.subject);
+      if (fullPrice === undefined) continue;
+
+      const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}__${enrolledAt.getDay()}`;
+      let ctx = ctxCache.get(ctxKey);
+      if (!ctx) {
+        ctx = buildDeliveredDatesContext(
+          state.sessions,
+          state.attendanceRecords,
+          {
+            level: student.level,
+            subject: enrollment.subject,
+            track: enrollment.track,
+            groupType: enrollment.groupType,
+          },
+          enrolledAt,
+        );
+        ctxCache.set(ctxKey, ctx);
+      }
+
+      const schedule = generateScheduleFor(rule, enrolledAt, asOf, ctx);
+      for (const installment of schedule) {
+        const dueDateKey = formatDateKey(installment.dueDate);
+        const key = `${enrollment.subject}__${dueDateKey}`;
+        if (existingKeys.has(key)) continue;
+        existingKeys.add(key);
+        generated.push({
+          id: makeId(),
+          studentId,
+          subject: enrollment.subject,
+          dueDate: dueDateKey,
+          month: formatMonthKey(installment.dueDate),
+          isPaid: installment.autoPaid,
+          amountDue: Math.round(fullPrice * installment.amountRatio),
+          amountPaid: installment.autoPaid
+            ? Math.round(fullPrice * installment.amountRatio)
+            : 0,
+          isHalfMonth: installment.isHalfMonth,
+          rule,
+          updatedAt,
+        });
+      }
+    }
+
+    if (generated.length > 0) {
+      set((s) => ({ payments: [...s.payments, ...generated] }));
+      void upsertPaymentsBatchDoc(generated);
+    }
+  }
+
+  // All due (not-yet-fully-paid) installments across every subject,
+  // dueDate-ascending then subject-locale, matching recordPartialPayment.
+  const candidates = get()
+    .payments.filter(
+      (p) =>
+        p.studentId === studentId &&
+        !isPaymentFullyPaid(p) &&
+        p.dueDate <= asOfKey,
+    )
+    .sort((a, b) =>
+      a.dueDate !== b.dueDate
+        ? a.dueDate.localeCompare(b.dueDate)
+        : a.subject.localeCompare(b.subject),
+    );
+
+  if (candidates.length === 0) return;
+
+  let credit = Math.round(totalPaid);
+  const nextById = new Map<string, Payment>();
+  const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = [];
+
+  for (const payment of candidates) {
+    if (credit <= 0) break;
+    const currentPaid = payment.amountPaid ?? 0;
+    const outstanding = Math.max(0, payment.amountDue - currentPaid);
+    if (outstanding <= 0) continue;
+    const apply = Math.min(outstanding, credit);
+    const amountPaid = currentPaid + apply;
+    const isPaid = amountPaid >= payment.amountDue;
+    nextById.set(payment.id, { ...payment, amountPaid, isPaid, updatedAt });
+    patches.push({ id: payment.id, amountPaid, isPaid, updatedAt });
+    credit -= apply;
+  }
+
+  if (patches.length === 0) return;
+
+  const previous = get().payments;
+  set((state) => ({
+    payments: state.payments.map((p) => nextById.get(p.id) ?? p),
+  }));
+  try {
+    await updatePaymentsBatchDoc(patches);
+  } catch (err) {
+    set({ payments: previous });
+    toast.error("Échec de l'enregistrement du paiement");
+    throw err;
+  }
 },
 
 /**

@@ -25,9 +25,11 @@ import type {
   GroupType,
   Level,
   Payment,
+  PriceEntry,
   Session,
   Student,
   Subject,
+  SubjectEnrollment,
   Track,
 } from "@/types/ennajd";
 
@@ -740,4 +742,34 @@ export function aggregateRegistrationFeeDebtors(
     count: rows.length,
     totalRemaining: rows.reduce((sum, row) => sum + row.remaining, 0),
   };
+}
+
+/**
+ * Pure helper — computes the total tuition (MAD) for a set of enrollments
+ * WITHOUT requiring a persisted student.id (used at creation time, before
+ * the student doc exists). Mirrors `getEffectivePrice` + `getBasePrice`:
+ * `customPrice ?? base price` per enrollment. Returns 0 when no price is
+ * defined for any enrollment (the caller disables the Paid input in that case).
+ */
+export function computeTuitionTotal(
+  enrollments: SubjectEnrollment[],
+  level: Level,
+  prices: PriceEntry[],
+): number {
+  let total = 0;
+  for (const enrollment of enrollments) {
+    if (enrollment.customPrice !== undefined) {
+      total += enrollment.customPrice;
+      continue;
+    }
+    const base = prices.find(
+      (p) =>
+        p.level === level &&
+        p.subject === enrollment.subject &&
+        p.track === enrollment.track &&
+        p.groupType === enrollment.groupType,
+    )?.price;
+    if (base !== undefined) total += base;
+  }
+  return total;
 }

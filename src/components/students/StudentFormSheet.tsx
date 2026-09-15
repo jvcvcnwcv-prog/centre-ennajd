@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { SubjectEnrollmentPicker } from "@/components/students/SubjectEnrollmentPicker";
@@ -22,7 +22,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
-import { REGISTRATION_FEE_DEFAULT } from "@/lib/ennajd-billing";
+import { REGISTRATION_FEE_DEFAULT, computeTuitionTotal } from "@/lib/ennajd-billing";
 import {
   LEVELS,
   isGroupTypeApplicable,
@@ -52,6 +52,8 @@ interface FormState {
   enrollments: SubjectEnrollment[];
   /** Create mode only — "paid the 100 DH registration fee at registration". */
   feePaidAtRegistration: boolean;
+  /** Create mode only — tuition paid at creation (MAD as string for input). */
+  tuitionPaidText: string;
 }
 
 const emptyForm: FormState = {
@@ -62,6 +64,7 @@ const emptyForm: FormState = {
   track: null,
   enrollments: [],
   feePaidAtRegistration: false,
+  tuitionPaidText: "",
 };
 
 function splitFullName(fullName: string): {
@@ -82,7 +85,44 @@ export function StudentFormSheet({
   const { t } = useI18n();
   const addStudent = useEnnajdState((s) => s.addStudent);
   const updateStudent = useEnnajdState((s) => s.updateStudent);
+  const applyInitialTuitionPayment = useEnnajdState(
+    (s) => s.applyInitialTuitionPayment,
+  );
+  const prices = useEnnajdState((s) => s.prices);
   const [form, setForm] = useState<FormState>(emptyForm);
+
+  // Tuition card computations (create mode only, when enrollments exist)
+  const tuitionTotal = useMemo(() => {
+    if (!form.enrollments.length) return 0;
+    return computeTuitionTotal(form.enrollments, form.level, prices);
+  }, [form.enrollments, form.level, prices]);
+
+  const tuitionPaid = useMemo(() => {
+    const val = Number(form.tuitionPaidText);
+    if (!Number.isFinite(val)) return 0;
+    return Math.max(0, Math.min(Math.round(val), tuitionTotal));
+  }, [form.tuitionPaidText, tuitionTotal]);
+
+  const tuitionRemaining = useMemo(() => {
+    return Math.max(0, tuitionTotal - tuitionPaid);
+  }, [tuitionTotal, tuitionPaid]);
+
+  // Per-subject breakdown for the collapsible section
+  const subjectBreakdown = useMemo(() => {
+    if (!form.enrollments.length) return [];
+    return form.enrollments.map((e) => {
+      const custom = e.customPrice;
+      if (custom !== undefined) return { subject: e.subject, price: custom };
+      const base = prices.find(
+        (p) =>
+          p.level === form.level &&
+          p.subject === e.subject &&
+          p.track === e.track &&
+          p.groupType === e.groupType,
+      )?.price;
+      return { subject: e.subject, price: base ?? 0 };
+    });
+  }, [form.enrollments, form.level, prices]);
 
   useEffect(() => {
     if (student) {
@@ -94,6 +134,7 @@ export function StudentFormSheet({
         track: student.track,
         enrollments: student.enrollments,
         feePaidAtRegistration: false,
+        tuitionPaidText: "",
       });
     } else {
       setForm(emptyForm);
@@ -121,63 +162,75 @@ export function StudentFormSheet({
     setForm((f) => ({ ...f, track, enrollments: [] }));
   }
 
-  function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const { firstName, lastName } = splitFullName(form.fullName);
-    if (!firstName || !lastName) {
-      toast.error(t("required"));
-      return;
-    }
-    if (trackRequired && !form.track) {
-      toast.error(t("required"));
-      return;
-    }
-    const missingGroupType = form.enrollments.some(
-      (enrollment) =>
-        isGroupTypeApplicable(form.level, enrollment.subject) && !enrollment.groupType,
-    );
-    if (missingGroupType) {
-      toast.error(t("invalidCombination"));
-      return;
-    }
-
-    // New students owe the 100 DH registration fee unless it was paid at
-    // registration (checkbox) or the student is Small-group-only (exempt —
-    // no fee field stored). Legacy/existing students keep their stored fee;
-    // edit mode never rewrites it (managed in the wallet instead).
-    let registrationFee: RegistrationFee | undefined;
-    if (!student && showFeeCheckbox) {
-      registrationFee = form.feePaidAtRegistration
-        ? {
-            amountDue: REGISTRATION_FEE_DEFAULT,
-            amountPaid: REGISTRATION_FEE_DEFAULT,
-            settledAt: new Date().toISOString(),
+  async function handleSubmit(e: React.FormEvent) {
+      e.preventDefault();
+      const { firstName, lastName } = splitFullName(form.fullName);
+      if (!firstName || !lastName) {
+        toast.error(t("required"));
+        return;
+      }
+      if (trackRequired && !form.track) {
+        toast.error(t("required"));
+        return;
+      }
+      const missingGroupType = form.enrollments.some(
+        (enrollment) =>
+          isGroupTypeApplicable(form.level, enrollment.subject) && !enrollment.groupType,
+      );
+      if (missingGroupType) {
+        toast.error(t("invalidCombination"));
+        return;
+      }
+  
+      // New students owe the 100 DH registration fee unless it was paid at
+      // registration (checkbox) or the student is Small-group-only (exempt —
+      // no fee field stored). Legacy/existing students keep their stored fee;
+      // edit mode never rewrites it (managed in the wallet instead).
+      let registrationFee: RegistrationFee | undefined;
+      if (!student && showFeeCheckbox) {
+        registrationFee = form.feePaidAtRegistration
+          ? {
+              amountDue: REGISTRATION_FEE_DEFAULT,
+              amountPaid: REGISTRATION_FEE_DEFAULT,
+              settledAt: new Date().toISOString(),
+            }
+          : {
+              amountDue: REGISTRATION_FEE_DEFAULT,
+              amountPaid: 0,
+            };
+      }
+  
+      const payload = {
+        firstName,
+        lastName,
+        whatsappPhone: form.whatsappPhone.trim(),
+        parentPhone: form.parentPhone.trim(),
+        level: form.level,
+        track: trackRequired ? form.track : null,
+        enrollments: form.enrollments,
+        ...(registrationFee ? { registrationFee } : {}),
+      };
+  
+      if (student) {
+        updateStudent(student.id, payload);
+      } else {
+        const newStudent = addStudent(payload);
+        // After student creation, distribute any tuition Paid across generated installments.
+        // Only in create mode (!student) and when there are enrollments.
+        if (!student && form.enrollments.length > 0 && tuitionTotal > 0 && tuitionPaid > 0) {
+          try {
+            await applyInitialTuitionPayment(newStudent.id, tuitionPaid, new Date());
+            toast.success(t("initialTuitionPaymentRecorded"));
+          } catch (err) {
+            toast.error(t("paymentSaveFailed"));
+            // Stay open on failure; the local snapshot was already reverted in the store.
+            return;
           }
-        : {
-            amountDue: REGISTRATION_FEE_DEFAULT,
-            amountPaid: 0,
-          };
+        }
+        toast.success(t("studentSaved"));
+        onOpenChange(false);
+      }
     }
-
-    const payload = {
-      firstName,
-      lastName,
-      whatsappPhone: form.whatsappPhone.trim(),
-      parentPhone: form.parentPhone.trim(),
-      level: form.level,
-      track: trackRequired ? form.track : null,
-      enrollments: form.enrollments,
-      ...(registrationFee ? { registrationFee } : {}),
-    };
-
-    if (student) {
-      updateStudent(student.id, payload);
-    } else {
-      addStudent(payload);
-    }
-    toast.success(t("studentSaved"));
-    onOpenChange(false);
-  }
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -274,6 +327,158 @@ export function StudentFormSheet({
               }
             />
           </div>
+
+          {/* Create mode only — hide in edit mode (wallet/pencil handles tuition there) */}
+          {!student && form.enrollments.length > 0 && (
+            <div className="space-y-2">
+              <div className="rounded-xl border border-border bg-muted/40 p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="font-semibold">{t("tuitionCardTitle")}</h3>
+                  <span className="text-xs text-muted-foreground">
+                    {t("tuitionTotalLabel")}
+                  </span>
+                </div>
+
+                {/* Total + Paid row */}
+                <div className="flex items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <Label className="text-sm font-medium">{t("tuitionTotalLabel")}</Label>
+                    <div className="text-lg font-bold">
+                      {tuitionTotal} MAD
+                      {tuitionTotal === 0 && (
+                        <span className="ml-1 text-xs font-normal text-muted-foreground">
+                          ({t("noPriceDefined")})
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex w-full max-w-[220px] flex-col gap-1.5 sm:flex-row">
+                    <Input
+                      type="number"
+                      min={0}
+                      max={tuitionTotal}
+                      step={1}
+                      placeholder={t("tuitionPaidPlaceholder")}
+                      value={form.tuitionPaidText}
+                      disabled={tuitionTotal === 0}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        const num = Number(value);
+                        if (value === "" || Number.isFinite(num)) {
+                          setForm((f) => ({ ...f, tuitionPaidText: value }));
+                        }
+                      }}
+                      aria-label={t("tuitionPaidLabel")}
+                      aria-describedby="tuition-paid-hint"
+                    />
+                    <div className="flex gap-1.5">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-9 flex-1"
+                        onClick={() =>
+                          setForm((f) => ({
+                            ...f,
+                            tuitionPaidText: String(
+                              Math.min(
+                                tuitionTotal,
+                                Math.max(0, Math.round(Number(f.tuitionPaidText || 0)) + 100),
+                              ),
+                            ),
+                          }))
+                        }
+                      >
+                        +100
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-9 flex-1"
+                        onClick={() =>
+                          setForm((f) => ({
+                            ...f,
+                            tuitionPaidText: String(
+                              Math.min(
+                                tuitionTotal,
+                                Math.max(0, Math.round(Number(f.tuitionPaidText || 0)) + 200),
+                              ),
+                            ),
+                          }))
+                        }
+                      >
+                        +200
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-9 flex-1"
+                        onClick={() =>
+                          setForm((f) => ({
+                            ...f,
+                            tuitionPaidText: String(
+                              Math.min(
+                                tuitionTotal,
+                                Math.max(0, Math.round(Number(f.tuitionPaidText || 0)) + 500),
+                              ),
+                            ),
+                          }))
+                        }
+                      >
+                        +500
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Remaining (calculated) */}
+                <div className="mt-3 flex items-center justify-between rounded-lg bg-background/60 px-3 py-2">
+                  <span className="text-sm font-medium" aria-label={t("tuitionRemainingWillBe")}>
+                    {t("tuitionRemainingWillBe")}
+                  </span>
+                  <span
+                    className={`text-lg font-bold ${
+                      tuitionRemaining > 0 ? "text-accent-foreground" : "text-success"
+                    }`}
+                    aria-label={t("remainingAmount")}
+                  >
+                    {tuitionRemaining} MAD
+                  </span>
+                </div>
+
+                {/* Validation message */}
+                {(form.tuitionPaidText !== "" && tuitionPaid > tuitionTotal) && (
+                  <p className="mt-2 text-sm text-destructive" id="tuition-paid-hint">
+                    {t("tuitionPaidExceedsTotal")}
+                  </p>
+                )}
+                {form.tuitionPaidText !== "" &&
+                  !Number.isFinite(Number(form.tuitionPaidText)) && (
+                    <p className="mt-2 text-sm text-destructive" id="tuition-paid-hint">
+                      {t("invalidTuitionPaid")}
+                    </p>
+                  )}
+
+                {/* Per-subject breakdown (collapsible) */}
+                <details className="mt-3">
+                  <summary className="cursor-pointer text-sm font-medium text-muted-foreground">
+                    {t("tuitionPerSubjectBreakdown")}
+                  </summary>
+                  <div className="mt-2 space-y-1 text-sm">
+                    {subjectBreakdown.map((item) => (
+                      <div key={item.subject} className="flex items-center justify-between">
+                        <span>{item.subject}</span>
+                        <span className="font-medium">{item.price} MAD</span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              </div>
+            </div>
+          )}
 
           {showFeeCheckbox && (
             <div className="space-y-1.5 rounded-xl border border-border bg-muted/40 p-3">

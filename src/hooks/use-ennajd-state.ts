@@ -668,6 +668,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
           prevAdvanceBalance,
           todayKey,
           now.toISOString(),
+          { student, sessions: get().sessions, prices: get().prices },
         );
 
         if (updated.length > 0) {
@@ -957,53 +958,59 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
       updatedAt,
     );
 
-    if (generated.length > 0) {
-      set((s) => ({ payments: [...s.payments, ...generated] }));
-      void upsertPaymentsBatchDoc(generated);
-    }
-
-    // Re-read after generation so the waterfall sees the newly-created
-    // installments across all subjects.
-    const paymentsNow = get().payments;
-
-    // Cross-subject waterfall: scan every non-fully-paid installment
-    // (subject=null), sorted by dueDate ascending. Surplus that can't be
-    // absorbed becomes advanceBalance on the student record.
-    const { updated, remaining, anyChanged } = applyCreditWaterfall(
-      paymentsNow,
-      studentId,
-      null, // cross-subject
-      Math.round(totalPaid),
-      asOfKey,
-      updatedAt,
-    );
-
-    if (!anyChanged) return;
-
-    const nextById = new Map(updated.map((p) => [p.id, p]));
-    const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
-      (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
-    );
-
-    set((state) => ({
-      payments: state.payments.map((p) => nextById.get(p.id) ?? p),
-    }));
-
-    let commitAdvanceBalance = false;
-    const prevBalance = student.advanceBalance ?? 0;
-    const nextBalance = prevBalance + remaining;
-    if (remaining > 0) {
-      set((state) => ({
-        students: state.students.map((s) =>
-          s.id === studentId
-            ? { ...s, advanceBalance: nextBalance }
-            : s,
-        ),
-      }));
-      commitAdvanceBalance = true;
-    }
+    const context = { student, sessions: get().sessions, prices: get().prices };
 
     try {
+      // Persist generated installments BEFORE running the waterfall so the
+      // DB and local state stay consistent. Awaited (not void-fired) so a
+      // failure rolls back both the generated rows and the credit patches.
+      if (generated.length > 0) {
+        set((s) => ({ payments: [...s.payments, ...generated] }));
+        await upsertPaymentsBatchDoc(generated);
+      }
+
+      // Re-read after generation so the waterfall sees the newly-created
+      // installments across all subjects.
+      const paymentsNow = get().payments;
+
+      // Cross-subject waterfall: scan every non-fully-paid installment
+      // (subject=null), sorted by dueDate ascending. Surplus that can't be
+      // absorbed becomes advanceBalance on the student record.
+      const { updated, remaining, anyChanged } = applyCreditWaterfall(
+        paymentsNow,
+        studentId,
+        null, // cross-subject
+        Math.round(totalPaid),
+        asOfKey,
+        updatedAt,
+        context,
+      );
+
+      if (!anyChanged) return;
+
+      const nextById = new Map(updated.map((p) => [p.id, p]));
+      const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
+        (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
+      );
+
+      set((state) => ({
+        payments: state.payments.map((p) => nextById.get(p.id) ?? p),
+      }));
+
+      let commitAdvanceBalance = false;
+      const prevBalance = student.advanceBalance ?? 0;
+      const nextBalance = prevBalance + remaining;
+      if (remaining > 0) {
+        set((state) => ({
+          students: state.students.map((s) =>
+            s.id === studentId
+              ? { ...s, advanceBalance: nextBalance }
+              : s,
+          ),
+        }));
+        commitAdvanceBalance = true;
+      }
+
       await updatePaymentsBatchDoc(patches);
       if (commitAdvanceBalance) {
         await updateStudentAdvanceBalanceDoc(studentId, nextBalance);

@@ -345,6 +345,97 @@ export function isPaymentFullyPaid(payment: Payment): boolean {
 // Advance-credit waterfall (cross-month surplus distribution)
 // ---------------------------------------------------------------------------
 
+/** Context passed by the store layer so the waterfall can apply attendance-
+ * sheet proration Rules A-D. When omitted, applyCreditWaterfall falls back
+ * to plain gap-filling (backward compatible). */
+export interface WaterfallContext {
+  student: Student;
+  sessions: Session[];
+  prices: PriceEntry[];
+}
+
+/** Null/undefined normalizer for track/groupType comparison — mirrors the
+ * helper in ennajd-taxonomy.ts but kept local to avoid a cross-module import
+ * in the pure billing layer. */
+export function normalizeNull<T extends string | null | undefined>(
+  value: T,
+): string | null {
+  return (value ?? null) as string | null;
+}
+
+/**
+ * Whether a subject carries session-based proration Rules A-D.
+ * 2BAC Small Groups (P.G 2BAC — 2Bac s.x Small on Math/PC/SVT) are EXEMPT:
+ * `getPaymentRuleFor` returns "B" (rolling join-date cycle) for them, so
+ * there is no calendar-aligned "current month" to prorate against — the
+ * waterfall falls back to plain gap-filling.
+ */
+export function isProratedSubject(student: Student, subject: Subject): boolean {
+  // Find the relevant enrollment for this subject.
+  for (const enrollment of student.enrollments) {
+    if (enrollment.subject !== subject) continue;
+    // Rule B combos are exempt (2Bac s.x Small on Math/PC/SVT).
+    if (getPaymentRuleFor(student.level, subject, enrollment.groupType, enrollment.track) === "B") {
+      return false;
+    }
+    return true;
+  }
+  // No enrollment found — treat as non-prorated (no-op).
+  return false;
+}
+
+/**
+ * Counts the STANDARD (non-one_off) sessions remaining in the current month
+ * for a given student+subject, from `from` (enrolledAt) through month-end.
+ * Uses the same combo-matching logic as `buildDeliveredDatesContext`.
+ *
+ * Returns `null` when no standard sessions exist for the combo
+ * (hasSession=false) — callers must fall back to plain gap-fill in that case.
+ */
+export function computeRemainingSessionsInMonth(
+  student: Student,
+  subject: Subject,
+  sessions: Session[],
+  from: Date,
+  asOfKey: string,
+): number | null {
+  // Find the enrollment's track/groupType for this subject.
+  const enrollment = student.enrollments.find((e) => e.subject === subject);
+  if (!enrollment) return null;
+
+  const monthEnd = new Date(
+    from.getFullYear(),
+    from.getMonth(),
+    daysInMonth(from.getFullYear(), from.getMonth()),
+  );
+
+  // Count standard sessions matching this combo whose date falls within
+  // [from, monthEnd] for recurring sessions, or whose date key falls in
+  // the same calendar month for one-off sessions.
+  let remaining = 0;
+  for (const session of sessions) {
+    if (!isStandardSession(session)) continue;
+    if (session.subject !== subject) continue;
+    if (session.level !== student.level) continue;
+    if (normalizeNull(session.track) !== normalizeNull(enrollment.track)) continue;
+    if (normalizeNull(session.groupType) !== normalizeNull(enrollment.groupType)) continue;
+
+    // Recurring sessions: count occurrences of dayOfWeek in [from, monthEnd].
+    // (In this simplified model, each recurring session represents a weekly
+    // slot. We count one occurrence per matching day-of-week in range.)
+    if (getSessionKind(session) === "recurring") {
+      const cursor = new Date(from);
+      while (cursor <= monthEnd) {
+        if (cursor.getDay() === session.dayOfWeek) remaining++;
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    }
+  }
+
+  if (remaining === 0) return null;
+  return remaining;
+}
+
 export interface CreditWaterfallResult {
   /** New payment objects reflecting the credit applied (only installment rows that changed).
    *  Unchanged installments are omitted — the caller merges by id. */
@@ -354,14 +445,36 @@ export interface CreditWaterfallResult {
   remaining: number;
   /** True when at least one installment was fully or partially changed. */
   anyChanged: boolean;
+  /** Total credit applied to the current month's installment(s) (dueDate <= asOfKey).
+   *  Populated only when `context` is provided; 0 otherwise. */
+  currentMonthCredit: number;
+  /** Total credit applied to future-month installment(s) (dueDate > asOfKey).
+   *  Populated only when `context` is provided; 0 otherwise. */
+  futureMonthCredit: number;
 }
 
 /**
  * Distributes `credit` (MAD) across installments in `dueDate`-ascending
  * order, applying to each installment's remaining gap (`amountDue - amountPaid`).
- * Unlike the old per-call logic that only touched `dueDate <= asOfKey`, this
- * function walks BOTH due and strictly-future installments — surplus rolls
- * forward into the next month(s) automatically.
+ *
+ * When `context` is provided AND the subject is proration-eligible
+ * (`isProratedSubject` returns true), the attendance-sheet proration
+ * Rules A-D are applied:
+ *
+ * - **Rule A (Single Session Skip)**: only 1 standard session remains in the
+ *   current month → skip crediting current-month installments entirely,
+ *   direct 100% to future installments.
+ * - **Rule B (Partial Attendance)**: 2+ standard sessions remain → credit a
+ *   prorated proportion (remaining / total) to the current month; surplus
+ *   carries forward to future months as advance credit.
+ * - **Rule C (Full Month)**: all sessions remain (joined at start of month)
+ *   → remaining == total → ratio = 1.0 → 100% to current month.
+ * - **Rule D (Gap Months)**: no installments exist for gap months (handled by
+ *   `generateRuleASchedule`) → the waterfall has no rows to credit, leaving
+ *   them as `-` automatically.
+ *
+ * When `context` is omitted OR the subject is exempt (2BAC Small Groups /
+ * Rule B cycle), falls back to plain gap-filling (backward compatible).
  *
  * - `subject === null` means cross-subject (any subject for that student) —
  *   used by the creation-time `applyInitialTuitionPayment` waterfall.
@@ -371,6 +484,8 @@ export interface CreditWaterfallResult {
  *   `advanceBalance`.
  * - Returns a minimal `updated` array (changed rows only) so callers can
  *   merge by `id` without rewriting the whole ledger.
+ * - `currentMonthCredit` and `futureMonthCredit` break down how much credit
+ *   landed on due vs. future installments (0 when no context).
  *
  * Pure — no React/Zustand, no hidden date().
  */
@@ -381,9 +496,18 @@ export function applyCreditWaterfall(
   credit: number,
   asOfKey: string,
   updatedAt: string,
+  context?: WaterfallContext,
 ): CreditWaterfallResult {
+  const emptyResult: CreditWaterfallResult = {
+    updated: [],
+    remaining: Math.max(0, Math.round(credit)),
+    anyChanged: false,
+    currentMonthCredit: 0,
+    futureMonthCredit: 0,
+  };
+
   if (!Number.isFinite(credit) || credit <= 0) {
-    return { updated: [], remaining: Math.max(0, Math.round(credit)), anyChanged: false };
+    return emptyResult;
   }
 
   // Walk every installment for this student that isn't already fully paid,
@@ -397,26 +521,125 @@ export function applyCreditWaterfall(
   );
   eligible.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 
+  // --- Proration Rules A-D (only when context is provided) ---
+  // When subject is null (cross-subject mode), we cannot determine a single
+  // subject's session counts — skip proration and use plain gap-filling.
+  const useProration =
+    !!context &&
+    subject !== null &&
+    isProratedSubject(context.student, subject);
+
+  let currentMonthRatio = 1;
+  let ruleASkipCurrent = false;
+
+  if (useProration) {
+    const enrollment = context.student.enrollments.find(
+      (e) => e.subject === subject,
+    );
+    if (enrollment) {
+      const enrolledAt = new Date(enrollment.enrolledAt ?? context.student.createdAt);
+      const from = enrolledAt <= new Date(asOfKey) ? enrolledAt : new Date(asOfKey);
+      const remainingSessions = computeRemainingSessionsInMonth(
+        context.student,
+        subject,
+        context.sessions,
+        from,
+        asOfKey,
+      );
+
+      if (remainingSessions !== null) {
+        // --- Rule A: Single Session Skip ---
+        // Only 1 standard session remains in the current month → skip
+        // current-month installments entirely (leave as '-'), direct 100%
+        // to future months.
+        if (remainingSessions === 1) {
+          ruleASkipCurrent = true;
+        } else {
+          // --- Rule B (Partial) & Rule C (Full Month) ---
+          // Compute total standard sessions in the current month to derive
+          // the proration ratio: remaining / total.
+          const monthStart = startOfMonth(from);
+          const monthEnd = new Date(
+            monthStart.getFullYear(),
+            monthStart.getMonth(),
+            daysInMonth(monthStart.getFullYear(), monthStart.getMonth()),
+          );
+          let total = 0;
+          for (const session of context.sessions) {
+            if (!isStandardSession(session)) continue;
+            if (session.subject !== subject) continue;
+            if (session.level !== context.student.level) continue;
+            if (normalizeNull(session.track) !== normalizeNull(enrollment.track)) continue;
+            if (normalizeNull(session.groupType) !== normalizeNull(enrollment.groupType)) continue;
+
+            if (getSessionKind(session) === "recurring") {
+              const cursor = new Date(monthStart);
+              while (cursor <= monthEnd) {
+                if (cursor.getDay() === session.dayOfWeek) total++;
+                cursor.setDate(cursor.getDate() + 1);
+              }
+            }
+          }
+
+          if (total > 0) {
+            currentMonthRatio = remainingSessions / total;
+          }
+          // Rule C: remaining == total → ratio = 1.0 → 100% current month
+          // Rule B: remaining < total → ratio < 1.0 → prorated
+        }
+      }
+    }
+  }
+
   const updated: Payment[] = [];
   let remaining = Math.max(0, Math.round(credit));
+  let currentMonthCredit = 0;
+  let futureMonthCredit = 0;
 
   for (const payment of eligible) {
     if (remaining <= 0) break;
+
+    const isCurrentMonth = payment.dueDate <= asOfKey;
+
+    // Rule A skip: leave current-month installments untouched.
+    if (ruleASkipCurrent && isCurrentMonth) {
+      continue;
+    }
+
     const currentPaid = payment.amountPaid ?? 0;
     const gap = Math.max(0, payment.amountDue - currentPaid);
     if (gap <= 0) continue;
 
-    const apply = Math.min(gap, remaining);
+    let apply: number;
+
+    if (useProration && isCurrentMonth) {
+      // Rule B / C: apply prorated proportion of credit to current month.
+      const proratedCredit = Math.round(credit * currentMonthRatio);
+      apply = Math.min(gap, proratedCredit, remaining);
+    } else {
+      apply = Math.min(gap, remaining);
+    }
+
+    if (apply <= 0) continue;
+
     const amountPaid = currentPaid + apply;
     const isPaid = amountPaid >= payment.amountDue;
     updated.push({ ...payment, amountPaid, isPaid, updatedAt });
     remaining -= apply;
+
+    if (isCurrentMonth) {
+      currentMonthCredit += apply;
+    } else {
+      futureMonthCredit += apply;
+    }
   }
 
   return {
     updated,
     remaining: Math.max(0, remaining),
     anyChanged: updated.length > 0,
+    currentMonthCredit,
+    futureMonthCredit,
   };
 }
 

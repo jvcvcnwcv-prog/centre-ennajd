@@ -436,6 +436,87 @@ export function computeRemainingSessionsInMonth(
   return remaining;
 }
 
+/** Per-subject proration profile used by the credit waterfall Rules A-D. */
+export interface SubjectProration {
+  /** Fraction of credit that belongs on the current month (remaining/total).
+   *  Rule C (full month) = 1.0; Rule B (partial) < 1.0; Rule A skip = 0. */
+  ratio: number;
+  /** Rule A (Single Session Skip): only 1 standard session remains -> skip
+   *  current-month installments entirely, direct 100% to future months. */
+  skipCurrent: boolean;
+}
+
+/**
+ * Pre-computes the attendance-sheet proration (Rules A/B/C/D) for a single
+ * subject. Returns null when the subject is exempt (Rule B cycle, i.e.
+ * 2Bac s.x Small) or no standard session data is available, so the caller
+ * falls back to plain gap-filling.
+ *
+ * Extracted from applyCreditWaterfall so the same logic runs once per
+ * subject (instead of once per call), enabling cross-subject mode.
+ */
+function computeSubjectProration(
+  student: Student,
+  subject: Subject,
+  sessions: Session[],
+  from: Date,
+  asOfKey: string,
+): SubjectProration | null {
+  // Rule B combos (2Bac s.x Small on Math/PC/SVT) are exempt — rolling cycle.
+  if (!isProratedSubject(student, subject)) return null;
+
+  const enrollment = student.enrollments.find((e) => e.subject === subject);
+  if (!enrollment) return null;
+
+  const remainingSessions = computeRemainingSessionsInMonth(
+    student,
+    subject,
+    sessions,
+    from,
+    asOfKey,
+  );
+
+  if (remainingSessions === null) return null;
+
+  // --- Rule A: Single Session Skip ---
+  // Only 1 standard session remains in the current month -> skip current-month
+  // installments entirely, direct 100% to future months.
+  if (remainingSessions === 1) {
+    return { ratio: 0, skipCurrent: true };
+  }
+
+  // --- Rules B (Partial) & C (Full Month) ---
+  // Compute total standard sessions in the current month to derive the
+  // proration ratio: remaining / total.
+  const monthStart = startOfMonth(from);
+  const monthEnd = new Date(
+    monthStart.getFullYear(),
+    monthStart.getMonth(),
+    daysInMonth(monthStart.getFullYear(), monthStart.getMonth()),
+  );
+  let total = 0;
+  for (const session of sessions) {
+    if (!isStandardSession(session)) continue;
+    if (session.subject !== subject) continue;
+    if (session.level !== student.level) continue;
+    if (normalizeNull(session.track) !== normalizeNull(enrollment.track)) continue;
+    if (normalizeNull(session.groupType) !== normalizeNull(enrollment.groupType)) continue;
+
+    if (getSessionKind(session) === "recurring") {
+      const cursor = new Date(monthStart);
+      while (cursor <= monthEnd) {
+        if (cursor.getDay() === session.dayOfWeek) total++;
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    }
+  }
+
+  const ratio = total > 0 ? remainingSessions / total : 1;
+  // Rule C: remaining == total -> ratio = 1.0 -> 100% current month.
+  // Rule B: remaining < total -> ratio < 1.0 -> prorated.
+  return { ratio, skipCurrent: false };
+}
+
 export interface CreditWaterfallResult {
   /** New payment objects reflecting the credit applied (only installment rows that changed).
    *  Unchanged installments are omitted — the caller merges by id. */
@@ -521,73 +602,32 @@ export function applyCreditWaterfall(
   );
   eligible.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 
-  // --- Proration Rules A-D (only when context is provided) ---
-  // When subject is null (cross-subject mode), we cannot determine a single
-  // subject's session counts — skip proration and use plain gap-filling.
-  const useProration =
-    !!context &&
-    subject !== null &&
-    isProratedSubject(context.student, subject);
-
-  let currentMonthRatio = 1;
-  let ruleASkipCurrent = false;
-
-  if (useProration) {
-    const enrollment = context.student.enrollments.find(
-      (e) => e.subject === subject,
-    );
-    if (enrollment) {
-      const enrolledAt = new Date(enrollment.enrolledAt ?? context.student.createdAt);
-      const from = enrolledAt <= new Date(asOfKey) ? enrolledAt : new Date(asOfKey);
-      const remainingSessions = computeRemainingSessionsInMonth(
+  // --- Proration Rules A-D (per-subject, pre-computed in a Map) ---
+  // In per-subject mode (subject !== null) only that subject is prorated.
+  // In cross-subject mode (subject === null) every proration-eligible
+  // enrollment is pre-computed so each payment looks up its own subject
+  // during the loop — this is what fixes the cross-subject bug where a single
+  // global flag previously blocked Rules A-D entirely during creation-time
+  // distribution (applyInitialTuitionPayment passes subject=null).
+  let subjectProration: Map<Subject, SubjectProration> | undefined;
+  if (context) {
+    subjectProration = new Map();
+    for (const enrollment of context.student.enrollments) {
+      // Per-subject mode: only compute for the requested subject.
+      if (subject !== null && enrollment.subject !== subject) continue;
+      const enrolledAt = new Date(
+        enrollment.enrolledAt ?? context.student.createdAt,
+      );
+      const from =
+        enrolledAt <= new Date(asOfKey) ? enrolledAt : new Date(asOfKey);
+      const proration = computeSubjectProration(
         context.student,
-        subject,
+        enrollment.subject,
         context.sessions,
         from,
         asOfKey,
       );
-
-      if (remainingSessions !== null) {
-        // --- Rule A: Single Session Skip ---
-        // Only 1 standard session remains in the current month → skip
-        // current-month installments entirely (leave as '-'), direct 100%
-        // to future months.
-        if (remainingSessions === 1) {
-          ruleASkipCurrent = true;
-        } else {
-          // --- Rule B (Partial) & Rule C (Full Month) ---
-          // Compute total standard sessions in the current month to derive
-          // the proration ratio: remaining / total.
-          const monthStart = startOfMonth(from);
-          const monthEnd = new Date(
-            monthStart.getFullYear(),
-            monthStart.getMonth(),
-            daysInMonth(monthStart.getFullYear(), monthStart.getMonth()),
-          );
-          let total = 0;
-          for (const session of context.sessions) {
-            if (!isStandardSession(session)) continue;
-            if (session.subject !== subject) continue;
-            if (session.level !== context.student.level) continue;
-            if (normalizeNull(session.track) !== normalizeNull(enrollment.track)) continue;
-            if (normalizeNull(session.groupType) !== normalizeNull(enrollment.groupType)) continue;
-
-            if (getSessionKind(session) === "recurring") {
-              const cursor = new Date(monthStart);
-              while (cursor <= monthEnd) {
-                if (cursor.getDay() === session.dayOfWeek) total++;
-                cursor.setDate(cursor.getDate() + 1);
-              }
-            }
-          }
-
-          if (total > 0) {
-            currentMonthRatio = remainingSessions / total;
-          }
-          // Rule C: remaining == total → ratio = 1.0 → 100% current month
-          // Rule B: remaining < total → ratio < 1.0 → prorated
-        }
-      }
+      if (proration) subjectProration.set(enrollment.subject, proration);
     }
   }
 
@@ -601,8 +641,11 @@ export function applyCreditWaterfall(
 
     const isCurrentMonth = payment.dueDate <= asOfKey;
 
+    // Look up this payment's own subject proration profile (Rules A-D).
+    const proration = subjectProration?.get(payment.subject);
+
     // Rule A skip: leave current-month installments untouched.
-    if (ruleASkipCurrent && isCurrentMonth) {
+    if (proration?.skipCurrent && isCurrentMonth) {
       continue;
     }
 
@@ -612,9 +655,9 @@ export function applyCreditWaterfall(
 
     let apply: number;
 
-    if (useProration && isCurrentMonth) {
+    if (proration && isCurrentMonth && proration.ratio > 0) {
       // Rule B / C: apply prorated proportion of credit to current month.
-      const proratedCredit = Math.round(credit * currentMonthRatio);
+      const proratedCredit = Math.round(credit * proration.ratio);
       apply = Math.min(gap, proratedCredit, remaining);
     } else {
       apply = Math.min(gap, remaining);

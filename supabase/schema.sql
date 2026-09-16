@@ -22,7 +22,8 @@ create table students (
   enrollments jsonb not null default '[]',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  registration_fee jsonb
+  registration_fee jsonb,
+  advance_balance integer not null default 0
 );
 
 -- Create index for level/track queries

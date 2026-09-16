@@ -103,9 +103,24 @@ export function updateStudentDoc(
       cleanUpdate[key] = value;
     }
   }
+  if (patch.advanceBalance !== undefined) {
+    cleanUpdate.advance_balance = patch.advanceBalance;
+  }
 
   return wrapSupabaseVoid(
     supabase.from("students").upsert(cleanUpdate as never),
+  );
+}
+
+export function updateStudentAdvanceBalanceDoc(
+  id: string,
+  advanceBalance: number,
+): Promise<void> {
+  return wrapSupabaseVoid(
+    supabase
+      .from("students")
+      .update({ advance_balance: Math.max(0, Math.round(advanceBalance)) } as never)
+      .eq("id", id),
   );
 }
 

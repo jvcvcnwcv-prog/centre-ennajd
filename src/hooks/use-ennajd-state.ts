@@ -12,6 +12,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import {
+  applyCreditWaterfall,
   buildDeliveredDatesContext,
   dedupePayments,
   formatDateKey,
@@ -42,6 +43,7 @@ import {
   updatePaymentsBatchDoc,
   updateSessionDoc,
   updateStudentDoc,
+  updateStudentAdvanceBalanceDoc,
   upsertAttendanceBatchDoc,
   upsertMessageDoc,
   upsertPaymentsBatchDoc,
@@ -204,6 +206,83 @@ export function computeTuitionTotal(
 let lastAutoAbsenceSweepMs: number | null = null;
 let lastSyncPaymentsMs: number | null = null;
 let lastExpiredSweepDateKey: string | null = null;
+
+/**
+ * Generates any missing installments for a single student across all their
+ * enrollments, up to `asOf`. Returns the newly-created payment rows (empty
+ * when the schedule already exists). The caller is expected to commit them
+ * to the local store + Firestore. This is the shared generation engine used
+ * by `syncPayments`, `recordPartialPayment`, and `applyInitialTuitionPayment`
+ * so future installments always exist before credit is applied.
+ */
+function generateInstallmentsForStudent(
+  student: Student,
+  asOf: Date,
+  asOfKey: string,
+  existingKeys: Set<string>,
+  updatedAt: string,
+): Payment[] {
+  const generated: Payment[] = [];
+  const ctxCache = new Map<string, DeliveredDatesContext>();
+
+  for (const enrollment of student.enrollments) {
+    const rule = getPaymentRuleFor(
+      student.level,
+      enrollment.subject,
+      enrollment.groupType,
+      enrollment.track,
+    );
+    const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+    const fullPrice = useEnnajdState.getState().getEffectivePrice(
+      student.id,
+      enrollment.subject,
+    );
+    if (fullPrice === undefined) continue;
+
+    const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}__${enrolledAt.getDay()}`;
+    let ctx = ctxCache.get(ctxKey);
+    if (!ctx) {
+      const state = useEnnajdState.getState();
+      ctx = buildDeliveredDatesContext(
+        state.sessions,
+        state.attendanceRecords,
+        {
+          level: student.level,
+          subject: enrollment.subject,
+          track: enrollment.track,
+          groupType: enrollment.groupType,
+        },
+        enrolledAt,
+      );
+      ctxCache.set(ctxKey, ctx);
+    }
+
+    const schedule = generateScheduleFor(rule, enrolledAt, asOf, ctx);
+    for (const installment of schedule) {
+      const dueDateKey = formatDateKey(installment.dueDate);
+      const key = `${student.id}__${enrollment.subject}__${dueDateKey}`;
+      if (existingKeys.has(key)) continue;
+      existingKeys.add(key);
+      generated.push({
+        id: makeId(),
+        studentId: student.id,
+        subject: enrollment.subject,
+        dueDate: dueDateKey,
+        month: formatMonthKey(installment.dueDate),
+        isPaid: installment.autoPaid,
+        amountDue: Math.round(fullPrice * installment.amountRatio),
+        amountPaid: installment.autoPaid
+          ? Math.round(fullPrice * installment.amountRatio)
+          : 0,
+        isHalfMonth: installment.isHalfMonth,
+        rule,
+        updatedAt,
+      });
+    }
+  }
+
+  return generated;
+}
 
 /**
  * Pure reactive-layer guard for `hydrate*` actions. `onSnapshot` fires on
@@ -556,57 +635,52 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       state.payments.map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
     );
     const newPayments: Payment[] = [];
-    // The delivered-dates context depends only on the combo (plus the
-    // enrolledAt day-of-week, which drives the no-session fallback), so the
-    // ~1000+ enrollments collapse to a handful of unique contexts instead of
-    // each re-scanning the whole attendance array.
-    const ctxCache = new Map<string, DeliveredDatesContext>();
 
     for (const student of state.students) {
-      for (const enrollment of student.enrollments) {
-        const rule = getPaymentRuleFor(student.level, enrollment.subject, enrollment.groupType, enrollment.track);
-        const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
-        const fullPrice = get().getEffectivePrice(student.id, enrollment.subject);
-        if (fullPrice === undefined) continue;
+      const prevAdvanceBalance = student.advanceBalance ?? 0;
 
-        const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}__${enrolledAt.getDay()}`;
-        let ctx = ctxCache.get(ctxKey);
-        if (!ctx) {
-          ctx = buildDeliveredDatesContext(
-            state.sessions,
-            state.attendanceRecords,
-            {
-              level: student.level,
-              subject: enrollment.subject,
-              track: enrollment.track,
-              groupType: enrollment.groupType,
-            },
-            enrolledAt,
-          );
-          ctxCache.set(ctxKey, ctx);
-        }
+      // Reuse the shared generator so future installments always exist
+      // before we try to consume advance credit on them.
+      const generateThrough = new Date(now);
+      generateThrough.setMonth(generateThrough.getMonth() + 1);
+      const studentGenerated = generateInstallmentsForStudent(
+        student,
+        generateThrough,
+        todayKey,
+        existingKeys,
+        now.toISOString(),
+      );
+      newPayments.push(...studentGenerated);
 
-        const schedule = generateScheduleFor(rule, enrolledAt, now, ctx);
-        for (const installment of schedule) {
-          const dueDateKey = formatDateKey(installment.dueDate);
-          const key = `${student.id}__${enrollment.subject}__${dueDateKey}`;
-          if (existingKeys.has(key)) continue;
-          existingKeys.add(key);
-          newPayments.push({
-            id: makeId(),
-            studentId: student.id,
-            subject: enrollment.subject,
-            dueDate: dueDateKey,
-            month: formatMonthKey(installment.dueDate),
-            isPaid: installment.autoPaid,
-            amountDue: Math.round(fullPrice * installment.amountRatio),
-            amountPaid: installment.autoPaid
-              ? Math.round(fullPrice * installment.amountRatio)
-              : 0,
-            isHalfMonth: installment.isHalfMonth,
-            rule,
-            updatedAt: now.toISOString(),
-          });
+      // CONSUME ADVANCE CREDIT: apply any existing advanceBalance to the
+      // earliest non-fully-paid installments across all subjects, sorted by
+      // dueDate ascending. Surplus that can't be absorbed by newly-generated
+      // installments remains as advanceBalance for next sync.
+      if (prevAdvanceBalance > 0) {
+        const allStudentPayments = [
+          ...state.payments.filter((p) => p.studentId === student.id),
+          ...studentGenerated,
+        ];
+        const { updated, remaining } = applyCreditWaterfall(
+          allStudentPayments,
+          student.id,
+          null,
+          prevAdvanceBalance,
+          todayKey,
+          now.toISOString(),
+        );
+
+        if (updated.length > 0) {
+          // Merge advance-credit patches into the outgoing batch.
+          for (const u of updated) newPayments.push(u);
+          // Deduct consumed credit from the student's advanceBalance.
+          set((s) => ({
+            students: s.students.map((s2) =>
+              s2.id === student.id
+                ? { ...s2, advanceBalance: remaining }
+                : s2,
+            ),
+          }));
         }
       }
     }
@@ -634,55 +708,102 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   },
 
   recordPartialPayment: async (studentId, subject, amount, asOf) => {
-  if (!(amount > 0)) return;
-  const asOfKey = formatDateKey(asOf);
-  const updatedAt = new Date().toISOString();
+    if (!(amount > 0)) return;
+    const asOfKey = formatDateKey(asOf);
+    const updatedAt = new Date().toISOString();
+    const state = get();
 
-  // Apply the credit in dueDate-ascending order across every unpaid,
-  // already-due installment of this student+subject — spillover rolls
-  // into the next one in the same atomic batch.
-  const candidates = get()
-    .payments.filter(
-      (p) =>
-        p.studentId === studentId &&
-        p.subject === subject &&
-        !p.isPaid &&
-        p.dueDate <= asOfKey,
-    )
-    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+    // Snapshot BOTH payments AND students (for advanceBalance revert) before
+    // the optimistic update, per the rollback-on-failure contract.
+    const previousPayments = state.payments;
+    const previousStudents = state.students;
+    const student = previousStudents.find((s) => s.id === studentId);
+    if (!student) return;
 
-  let remaining = amount;
-  const nextPayments: Payment[] = [];
-  const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = [];
+    // Ensure future installments exist for THIS student+subject before
+    // applying the waterfall, so surplus has somewhere to land. Generate
+    // one extra month beyond asOf so a partial can reach a future invoice.
+    const existingKeys = new Set(
+      previousPayments
+        .filter((p) => p.studentId === studentId && p.subject === subject)
+        .map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
+    );
+    // Generate one month ahead so the surplus can land on next month's bill.
+    const generateThrough = new Date(asOf);
+    generateThrough.setMonth(generateThrough.getMonth() + 2);
+    const futureInstallments = generateInstallmentsForStudent(
+      student,
+      generateThrough,
+      asOfKey,
+      existingKeys,
+      updatedAt,
+    );
+    // Filter to just the target subject (generateInstallmentsForStudent is
+    // cross-subject for applyInitialTuitionPayment, but here we need per-subject).
+    const filteredGenerated = futureInstallments.filter(
+      (p) => p.subject === subject,
+    );
 
-  for (const payment of candidates) {
-    if (remaining <= 0) break;
-    const currentPaid = payment.amountPaid ?? 0;
-    const outstanding = Math.max(0, payment.amountDue - currentPaid);
-    if (outstanding <= 0) continue;
+    if (filteredGenerated.length > 0) {
+      set((s) => ({ payments: [...s.payments, ...filteredGenerated] }));
+      void upsertPaymentsBatchDoc(filteredGenerated);
+    }
 
-    const apply = Math.min(outstanding, remaining);
-    const amountPaid = currentPaid + apply;
-    const isPaid = payment.isPaid || amountPaid >= payment.amountDue;
-    nextPayments.push({ ...payment, amountPaid, isPaid, updatedAt });
-    patches.push({ id: payment.id, amountPaid, isPaid, updatedAt });
-    remaining -= apply;
-  }
+    // Re-read after generation so the waterfall sees the newly-created
+    // future installments.
+    const paymentsNow = get().payments;
 
-  if (patches.length === 0) return;
+    // Apply the credit waterfall across ALL non-fully-paid installments for
+    // this student+subject, in dueDate-ascending order — due AND future.
+    // Surplus that can't be absorbed rolls forward month by month; any still
+    // unabsorbed credit becomes advanceBalance on the student record.
+    const { updated, remaining, anyChanged } = applyCreditWaterfall(
+      paymentsNow,
+      studentId,
+      subject,
+      Math.round(amount),
+      asOfKey,
+      updatedAt,
+    );
 
-  const nextById = new Map(nextPayments.map((p) => [p.id, p]));
-  const previous = get().payments;
-  set((state) => ({
-    payments: state.payments.map((p) => nextById.get(p.id) ?? p),
-  }));
-  try {
-    await updatePaymentsBatchDoc(patches);
-  } catch (err) {
-    set({ payments: previous });
-    toast.error("Échec de l'enregistrement du paiement");
-  }
-},
+    if (!anyChanged) return;
+
+    const nextById = new Map(updated.map((p) => [p.id, p]));
+    set((state) => ({
+      payments: state.payments.map((p) => nextById.get(p.id) ?? p),
+    }));
+
+    // Snapshot + apply advanceBalance if surplus remains.
+    const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
+      (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
+    );
+
+    let commitAdvanceBalance = false;
+    if (remaining > 0) {
+      const prevBalance = student.advanceBalance ?? 0;
+      const nextBalance = prevBalance + remaining;
+      set((state) => ({
+        students: state.students.map((s) =>
+          s.id === studentId
+            ? { ...s, advanceBalance: nextBalance }
+            : s,
+        ),
+      }));
+      commitAdvanceBalance = true;
+    }
+
+    try {
+      await updatePaymentsBatchDoc(patches);
+      if (commitAdvanceBalance) {
+        const prevBalance = student.advanceBalance ?? 0;
+        const nextBalance = prevBalance + remaining;
+        await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+      }
+    } catch (err) {
+      set({ payments: previousPayments, students: previousStudents });
+      toast.error("Échec de l'enregistrement du paiement");
+    }
+  },
 
 /**
  * Pencil dialog action — lands the student+subject's DUE remaining exactly
@@ -795,142 +916,104 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
  * This is a cross-subject generalization of `recordPartialPayment`: instead
  * of filtering to one subject, it scans every subject of the student, so a
  * single credit can spill from a Math installment into a PC installment when
- * the first subject's due installments are exhausted.
+ * the first subject's due installments are exhausted. Surplus that can't be
+ * absorbed by any installment is stored as `advanceBalance` on the student.
  *
  * Optimistic local update (snapshot + rollback on failure), then a single
  * `updatePaymentsBatchDoc` commit. On failure the caller (StudentFormSheet)
  * stays open; the error toast is fired here and the local snapshot reverted.
  */
-applyInitialTuitionPayment: async (studentId, totalPaid, asOf) => {
-  const asOfKey = formatDateKey(asOf);
-  const updatedAt = new Date().toISOString();
+  applyInitialTuitionPayment: async (studentId, totalPaid, asOf) => {
+    const asOfKey = formatDateKey(asOf);
+    const updatedAt = new Date().toISOString();
 
-  if (!Number.isFinite(totalPaid) || totalPaid <= 0) return;
+    if (!Number.isFinite(totalPaid) || totalPaid <= 0) return;
 
-  // Ensure installments exist for this student before distributing credit.
-  // `syncPayments` is throttled to once/day + once/min and may not have run
-  // yet for the just-created student (the realtime echo is async). Generate
-  // inline for this student only — `syncPayments`' `existingKeys` dedupe
-  // means these rows are skipped on the next full sync, and `hydratePayments`
-  // + `dedupePayments` collapse any realtime duplicates.
-  const state = get();
-  const student = state.students.find((s) => s.id === studentId);
-  if (!student) return;
+    // Snapshot BOTH payments AND students (for advanceBalance revert) before
+    // the optimistic update, per the rollback-on-failure contract.
+    const previousPayments = get().payments;
+    const previousStudents = get().students;
+    const student = previousStudents.find((s) => s.id === studentId);
+    if (!student) return;
 
-  const existingKeys = new Set(
-    state.payments
-      .filter((p) => p.studentId === studentId)
-      .map((p) => `${p.subject}__${p.dueDate}`),
-  );
-  const generated: Payment[] = [];
-  {
-    const ctxCache = new Map<string, DeliveredDatesContext>();
-    for (const enrollment of student.enrollments) {
-      const rule = getPaymentRuleFor(
-        student.level,
-        enrollment.subject,
-        enrollment.groupType,
-        enrollment.track,
-      );
-      const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
-      const fullPrice = get().getEffectivePrice(studentId, enrollment.subject);
-      if (fullPrice === undefined) continue;
-
-      const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}__${enrolledAt.getDay()}`;
-      let ctx = ctxCache.get(ctxKey);
-      if (!ctx) {
-        ctx = buildDeliveredDatesContext(
-          state.sessions,
-          state.attendanceRecords,
-          {
-            level: student.level,
-            subject: enrollment.subject,
-            track: enrollment.track,
-            groupType: enrollment.groupType,
-          },
-          enrolledAt,
-        );
-        ctxCache.set(ctxKey, ctx);
-      }
-
-      const schedule = generateScheduleFor(rule, enrolledAt, asOf, ctx);
-      for (const installment of schedule) {
-        const dueDateKey = formatDateKey(installment.dueDate);
-        const key = `${enrollment.subject}__${dueDateKey}`;
-        if (existingKeys.has(key)) continue;
-        existingKeys.add(key);
-        generated.push({
-          id: makeId(),
-          studentId,
-          subject: enrollment.subject,
-          dueDate: dueDateKey,
-          month: formatMonthKey(installment.dueDate),
-          isPaid: installment.autoPaid,
-          amountDue: Math.round(fullPrice * installment.amountRatio),
-          amountPaid: installment.autoPaid
-            ? Math.round(fullPrice * installment.amountRatio)
-            : 0,
-          isHalfMonth: installment.isHalfMonth,
-          rule,
-          updatedAt,
-        });
-      }
-    }
+    // Ensure installments exist for this student before distributing credit.
+    // `syncPayments` is throttled to once/day + once/min and may not have run
+    // yet for the just-created student (the realtime echo is async). Generate
+    // inline for this student only — `syncPayments`' `existingKeys` dedupe
+    // means these rows are skipped on the next full sync, and `hydratePayments`
+    // + `dedupePayments` collapse any realtime duplicates.
+    const existingKeys = new Set(
+      previousPayments
+        .filter((p) => p.studentId === studentId)
+        .map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
+    );
+    const generateThrough = new Date(asOf);
+    generateThrough.setMonth(generateThrough.getMonth() + 2);
+    const generated = generateInstallmentsForStudent(
+      student,
+      generateThrough,
+      asOfKey,
+      existingKeys,
+      updatedAt,
+    );
 
     if (generated.length > 0) {
       set((s) => ({ payments: [...s.payments, ...generated] }));
       void upsertPaymentsBatchDoc(generated);
     }
-  }
 
-  // All due (not-yet-fully-paid) installments across every subject,
-  // dueDate-ascending then subject-locale, matching recordPartialPayment.
-  const candidates = get()
-    .payments.filter(
-      (p) =>
-        p.studentId === studentId &&
-        !isPaymentFullyPaid(p) &&
-        p.dueDate <= asOfKey,
-    )
-    .sort((a, b) =>
-      a.dueDate !== b.dueDate
-        ? a.dueDate.localeCompare(b.dueDate)
-        : a.subject.localeCompare(b.subject),
+    // Re-read after generation so the waterfall sees the newly-created
+    // installments across all subjects.
+    const paymentsNow = get().payments;
+
+    // Cross-subject waterfall: scan every non-fully-paid installment
+    // (subject=null), sorted by dueDate ascending. Surplus that can't be
+    // absorbed becomes advanceBalance on the student record.
+    const { updated, remaining, anyChanged } = applyCreditWaterfall(
+      paymentsNow,
+      studentId,
+      null, // cross-subject
+      Math.round(totalPaid),
+      asOfKey,
+      updatedAt,
     );
 
-  if (candidates.length === 0) return;
+    if (!anyChanged) return;
 
-  let credit = Math.round(totalPaid);
-  const nextById = new Map<string, Payment>();
-  const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = [];
+    const nextById = new Map(updated.map((p) => [p.id, p]));
+    const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
+      (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
+    );
 
-  for (const payment of candidates) {
-    if (credit <= 0) break;
-    const currentPaid = payment.amountPaid ?? 0;
-    const outstanding = Math.max(0, payment.amountDue - currentPaid);
-    if (outstanding <= 0) continue;
-    const apply = Math.min(outstanding, credit);
-    const amountPaid = currentPaid + apply;
-    const isPaid = amountPaid >= payment.amountDue;
-    nextById.set(payment.id, { ...payment, amountPaid, isPaid, updatedAt });
-    patches.push({ id: payment.id, amountPaid, isPaid, updatedAt });
-    credit -= apply;
-  }
+    set((state) => ({
+      payments: state.payments.map((p) => nextById.get(p.id) ?? p),
+    }));
 
-  if (patches.length === 0) return;
+    let commitAdvanceBalance = false;
+    const prevBalance = student.advanceBalance ?? 0;
+    const nextBalance = prevBalance + remaining;
+    if (remaining > 0) {
+      set((state) => ({
+        students: state.students.map((s) =>
+          s.id === studentId
+            ? { ...s, advanceBalance: nextBalance }
+            : s,
+        ),
+      }));
+      commitAdvanceBalance = true;
+    }
 
-  const previous = get().payments;
-  set((state) => ({
-    payments: state.payments.map((p) => nextById.get(p.id) ?? p),
-  }));
-  try {
-    await updatePaymentsBatchDoc(patches);
-  } catch (err) {
-    set({ payments: previous });
-    toast.error("Échec de l'enregistrement du paiement");
-    throw err;
-  }
-},
+    try {
+      await updatePaymentsBatchDoc(patches);
+      if (commitAdvanceBalance) {
+        await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+      }
+    } catch (err) {
+      set({ payments: previousPayments, students: previousStudents });
+      toast.error("Échec de l'enregistrement du paiement");
+      throw err;
+    }
+  },
 
 /**
  * Pencil dialog action — writes/clears the free-text `paymentNote` on the
@@ -1083,7 +1166,13 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
   },
 
   hydrateStudents: (students) => {
-    const next = replaceIfChanged(get().students, students);
+    // Materialize advanceBalance (default 0) for legacy students who predate
+    // the `advance_balance` column — prevents undefined/NaN in downstream
+    // arithmetic (syncPayments, StudentTable Reste).
+    const normalized = students.map((s) =>
+      s.advanceBalance === undefined ? { ...s, advanceBalance: 0 } : s,
+    );
+    const next = replaceIfChanged(get().students, normalized);
     const hasSynced = get().hasSyncedStudents;
     if (next) {
       set({ students: next, hasSyncedStudents: true });

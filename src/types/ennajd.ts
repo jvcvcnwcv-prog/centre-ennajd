@@ -91,6 +91,8 @@ export interface Student {
   createdAt: string; // ISO date string — join date, used later for billing rules
   /** Absent on legacy students = implicitly paid; see RegistrationFee. */
   registrationFee?: RegistrationFee;
+  /** Cross-subject advance credit (MAD) carried over from over-payments. */
+  advanceBalance?: number;
 }
 
 /**

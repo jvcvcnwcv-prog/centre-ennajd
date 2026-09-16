@@ -213,8 +213,17 @@ export function StudentTable({ students, onEdit, emptyState }: StudentTableProps
             }
       map.set(payment.studentId, entry);
     }
+    // Subtract each student's advanceBalance (cross-subject credit carried
+    // over from prior over-payments) so the "Reste" reflects the true net
+    // amount the student owes.
+    for (const student of students) {
+      const entry = map.get(student.id);
+      if (entry && student.advanceBalance && student.advanceBalance > 0) {
+        entry.remaining = Math.max(0, entry.remaining - student.advanceBalance);
+      }
+    }
     return map;
-  }, [payments]);
+  }, [payments, students]);
 
   const totalPages = Math.max(1, Math.ceil(students.length / PAGE_SIZE));
 

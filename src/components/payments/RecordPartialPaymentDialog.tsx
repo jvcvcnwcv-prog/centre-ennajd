@@ -86,6 +86,11 @@ export function RecordPartialPaymentDialog({
   const exceedsRemaining = isValidAmount && amount > totalRemaining;
   const blockedByExceeds = exceedsRemaining && !exceedsConfirmed;
   const canSubmit = isValidAmount && !blockedByExceeds;
+  // Surplus = amount paid beyond current-month dues (carries to next month).
+  const carryOver =
+    isValidAmount && amount > totalRemaining
+      ? Math.round(amount - totalRemaining)
+      : 0;
 
   // Reset the input + confirmation state on every (re)open.
   useEffect(() => {
@@ -246,6 +251,31 @@ export function RecordPartialPaymentDialog({
                 >
                   {t("partialPaymentExceedsConfirm")}
                 </Button>
+              </div>
+            )}
+
+            {/* Carry-over preview — shown when the entered amount exceeds
+                current-month dues and confirmation is given. */}
+            {carryOver > 0 && exceedsConfirmed && (
+              <div className="rounded-lg border border-success/30 bg-success/10 px-3 py-2.5">
+                <p className="text-xs font-medium text-success/80">
+                  {t("advanceCredit")}
+                </p>
+                <p className="mt-1 text-sm text-success/90">
+                  {t("advanceCreditCarryOver").replace("{amount}", String(carryOver))}
+                </p>
+              </div>
+            )}
+
+            {/* Advance balance already on record — always visible. */}
+            {student.advanceBalance > 0 && (
+              <div className="rounded-lg border border-accent/30 bg-accent/10 px-3 py-2.5">
+                <p className="text-xs font-medium text-accent-foreground/80">
+                  {t("advanceBalanceLabel")}
+                </p>
+                <p className="mt-1 text-sm font-bold text-accent-foreground">
+                  {student.advanceBalance} MAD
+                </p>
               </div>
             )}
           </div>

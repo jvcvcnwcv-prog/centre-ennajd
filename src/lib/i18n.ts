@@ -381,6 +381,12 @@ const dictionary = {
     paymentSaveFailed: "Échec de l'enregistrement du paiement",
     paymentSaveFailedHint:
       "Le paiement n'a pas pu être enregistré. Vos modifications locales ont été annulées — réessayez.",
+    advanceCredit: "Crédit d'avance",
+    advanceApplied: "Crédit d'avance appliqué",
+    advanceCreditCarryOver:
+      "{amount} MAD seront appliqués à la facture du mois prochain",
+    advanceBalanceLabel: "Solde d'avance",
+    nextDueColumn: "Prochaine échéance",
   },
   ar: {
     appName: "مركز النجد",
@@ -747,6 +753,12 @@ const dictionary = {
     paymentSaveFailed: "فشل حفظ الدفع",
     paymentSaveFailedHint:
       "تعذر حفظ الدفع. تم إلغاء التغييرات المحلية — حاول مرة أخرى.",
+    advanceCredit: "رصيد مقدماً",
+    advanceApplied: "تم تطبيق الرصيد المتقدّن",
+    advanceCreditCarryOver:
+      "سيتم تطبيق {amount} درهم على فاتورة الشهر القادم",
+    advanceBalanceLabel: "الرصيد المتقدّن",
+    nextDueColumn: "الاستحقاق الجاي",
   },
 } satisfies Record<LangCode, Record<string, string>>;
 

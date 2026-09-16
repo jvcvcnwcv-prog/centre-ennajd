@@ -37,6 +37,7 @@ export function studentToRow(student: Student): StudentsRow {
     registration_fee:
       ((student.registrationFee as unknown) as StudentsRow["registration_fee"]) ??
       null,
+    advance_balance: student.advanceBalance ?? 0,
   };
 }
 
@@ -55,6 +56,7 @@ export function rowToStudent(row: StudentsRow): Student {
     registrationFee:
       ((row.registration_fee as unknown) as Student["registrationFee"]) ??
       undefined,
+    advanceBalance: row.advance_balance ?? 0,
   };
 }
 

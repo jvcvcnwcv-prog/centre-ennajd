@@ -319,6 +319,111 @@ export function isPaymentFullyPaid(payment: Payment): boolean {
   return payment.isPaid || (payment.amountPaid ?? 0) >= payment.amountDue;
 }
 
+// ---------------------------------------------------------------------------
+// Advance-credit waterfall (cross-month surplus distribution)
+// ---------------------------------------------------------------------------
+
+export interface CreditWaterfallResult {
+  /** New payment objects reflecting the credit applied (only installment rows that changed).
+   *  Unchanged installments are omitted — the caller merges by id. */
+  updated: Payment[];
+  /** Credit that could not be absorbed by any installment (dueDate-ascending).
+   *  This leftover must be stored as `advanceBalance` on the student. */
+  remaining: number;
+  /** True when at least one installment was fully or partially changed. */
+  anyChanged: boolean;
+}
+
+/**
+ * Distributes `credit` (MAD) across installments in `dueDate`-ascending
+ * order, applying to each installment's remaining gap (`amountDue - amountPaid`).
+ * Unlike the old per-call logic that only touched `dueDate <= asOfKey`, this
+ * function walks BOTH due and strictly-future installments — surplus rolls
+ * forward into the next month(s) automatically.
+ *
+ * - `subject === null` means cross-subject (any subject for that student) —
+ *   used by the creation-time `applyInitialTuitionPayment` waterfall.
+ * - Only installments that genuinely have a remaining gap (not fully paid)
+ *   are credited. Once credit is exhausted or all gaps are filled, the
+ *   function returns the leftover as `remaining` for the caller to stash in
+ *   `advanceBalance`.
+ * - Returns a minimal `updated` array (changed rows only) so callers can
+ *   merge by `id` without rewriting the whole ledger.
+ *
+ * Pure — no React/Zustand, no hidden date().
+ */
+export function applyCreditWaterfall(
+  payments: Payment[],
+  studentId: string,
+  subject: Subject | null,
+  credit: number,
+  asOfKey: string,
+  updatedAt: string,
+): CreditWaterfallResult {
+  if (!Number.isFinite(credit) || credit <= 0) {
+    return { updated: [], remaining: Math.max(0, Math.round(credit)), anyChanged: false };
+  }
+
+  // Walk every installment for this student that isn't already fully paid,
+  // in dueDate-ascending order — due AND future. Cross-subject mode scans
+  // all subjects; per-subject mode filters to one.
+  const eligible = payments.filter(
+    (p) =>
+      p.studentId === studentId &&
+      (subject === null || p.subject === subject) &&
+      !isPaymentFullyPaid(p),
+  );
+  eligible.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+
+  const updated: Payment[] = [];
+  let remaining = Math.max(0, Math.round(credit));
+
+  for (const payment of eligible) {
+    if (remaining <= 0) break;
+    const currentPaid = payment.amountPaid ?? 0;
+    const gap = Math.max(0, payment.amountDue - currentPaid);
+    if (gap <= 0) continue;
+
+    const apply = Math.min(gap, remaining);
+    const amountPaid = currentPaid + apply;
+    const isPaid = amountPaid >= payment.amountDue;
+    updated.push({ ...payment, amountPaid, isPaid, updatedAt });
+    remaining -= apply;
+  }
+
+  return {
+    updated,
+    remaining: Math.max(0, remaining),
+    anyChanged: updated.length > 0,
+  };
+}
+
+/**
+ * Computes the prorated cost for the current month — the sum of remaining
+ * gaps on unpaid installments whose dueDate <= asOfKey (the app-wide "due"
+ * definition). Used by the dialog to show how much the current month actually
+ * owes before showing the carry-over surplus.
+ */
+export function computeProratedCurrentMonthCost(
+  payments: Payment[],
+  studentId: string,
+  subject: Subject,
+  asOfKey: string,
+): number {
+  let cost = 0;
+  for (const p of payments) {
+    if (
+      p.studentId === studentId &&
+      p.subject === subject &&
+      !isPaymentFullyPaid(p) &&
+      p.dueDate <= asOfKey
+    ) {
+      cost += getPaymentRemaining(p);
+    }
+  }
+  return cost;
+}
+
 /**
  * One student's due position for a single subject, relative to an explicit
  * "as of" date key. "Due" uses the app-wide outstanding definition (same as
@@ -349,11 +454,18 @@ export interface StudentSubjectDueBalance {
   isPartiallyPaid: boolean;
 }
 
+/**
+ * Per-subject due position for a single student. Accepts an optional
+ * `advanceBalance` to net off cross-subject credit that has been carried
+ * forward — the `remaining` field reflects the true net amount owed for
+ * this subject after advance credit is applied.
+ */
 export function getDueBalanceForStudentSubject(
   payments: Payment[],
   studentId: string,
   subject: Subject,
   asOfKey: string,
+  advanceBalance = 0,
 ): StudentSubjectDueBalance {
   const dueUnpaid: Payment[] = [];
   let dueTotal = 0;
@@ -459,6 +571,11 @@ export interface SubjectOverdueRow {
   isPartiallyPaid: boolean;
   /** True when any installment is a half-month charge. */
   isHalfMonth: boolean;
+  /** The earliest future installment with a remaining gap (dueDate > todayKey).
+   *  Tracks how much surplus has been pre-paid forward via advanceBalance. */
+  nextDueDate: string | null;
+  /** Remaining gap on that next-due installment (MAD). 0 when fully pre-paid. */
+  nextDueRemaining: number;
 }
 
 export function aggregateOverdueInstallments(
@@ -468,36 +585,68 @@ export function aggregateOverdueInstallments(
   const rows = new Map<string, SubjectOverdueRow>();
 
   for (const payment of payments) {
-    // Same strict "due" definition as getDueBalanceForStudentSubject:
-    // not paid (flag OR fully covered by amountPaid) AND dueDate <= today.
-    if (isPaymentFullyPaid(payment) || payment.dueDate > todayKey) continue;
-
     const key = `${payment.studentId}__${payment.subject}`;
     let row = rows.get(key);
-    if (!row) {
-      row = {
-        studentId: payment.studentId,
-        subject: payment.subject,
-        installments: [],
-        totalRemaining: 0,
-        totalAmountPaid: 0,
-        earliestDueDate: payment.dueDate,
-        latestDueDate: payment.dueDate,
-        isOverdue: false,
-        isPartiallyPaid: false,
-        isHalfMonth: false,
-      };
-      rows.set(key, row);
+
+    // --- Due & unpaid (dueDate <= todayKey, not fully paid) ---
+    if (!isPaymentFullyPaid(payment) && payment.dueDate <= todayKey) {
+      if (!row) {
+        row = {
+          studentId: payment.studentId,
+          subject: payment.subject,
+          installments: [],
+          totalRemaining: 0,
+          totalAmountPaid: 0,
+          earliestDueDate: payment.dueDate,
+          latestDueDate: payment.dueDate,
+          isOverdue: false,
+          isPartiallyPaid: false,
+          isHalfMonth: false,
+          nextDueDate: null,
+          nextDueRemaining: 0,
+        };
+        rows.set(key, row);
+      }
+
+      row.installments.push(payment);
+      row.totalRemaining += getPaymentRemaining(payment);
+      row.totalAmountPaid += payment.amountPaid ?? 0;
+      if (payment.dueDate < row.earliestDueDate) row.earliestDueDate = payment.dueDate;
+      if (payment.dueDate > row.latestDueDate) row.latestDueDate = payment.dueDate;
+      if (payment.dueDate < todayKey) row.isOverdue = true;
+      if (isPaymentPartiallyPaid(payment)) row.isPartiallyPaid = true;
+      if (payment.isHalfMonth) row.isHalfMonth = true;
     }
 
-    row.installments.push(payment);
-    row.totalRemaining += getPaymentRemaining(payment);
-    row.totalAmountPaid += payment.amountPaid ?? 0;
-    if (payment.dueDate < row.earliestDueDate) row.earliestDueDate = payment.dueDate;
-    if (payment.dueDate > row.latestDueDate) row.latestDueDate = payment.dueDate;
-    if (payment.dueDate < todayKey) row.isOverdue = true;
-    if (isPaymentPartiallyPaid(payment)) row.isPartiallyPaid = true;
-    if (payment.isHalfMonth) row.isHalfMonth = true;
+    // --- Future installment with a remaining gap (dueDate > todayKey) ---
+    // Tracks how much surplus has been pre-paid forward via advanceBalance.
+    if (!isPaymentFullyPaid(payment) && payment.dueDate > todayKey) {
+      if (!row) {
+        // No due installments yet — seed a row so the next-due shows even
+        // before anything is past due.
+        row = {
+          studentId: payment.studentId,
+          subject: payment.subject,
+          installments: [],
+          totalRemaining: 0,
+          totalAmountPaid: 0,
+          earliestDueDate: payment.dueDate,
+          latestDueDate: payment.dueDate,
+          isOverdue: false,
+          isPartiallyPaid: false,
+          isHalfMonth: false,
+          nextDueDate: payment.dueDate,
+          nextDueRemaining: getPaymentRemaining(payment),
+        };
+        rows.set(key, row);
+      } else if (
+        row.nextDueDate === null ||
+        payment.dueDate < row.nextDueDate
+      ) {
+        row.nextDueDate = payment.dueDate;
+        row.nextDueRemaining = getPaymentRemaining(payment);
+      }
+    }
   }
 
   // dueDate ascending within each row (earliest first for settle/partial credit).

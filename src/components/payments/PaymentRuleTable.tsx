@@ -155,6 +155,7 @@ export function PaymentRuleTable({
               <TableHead>{t("subject")}</TableHead>
               <TableHead>{t("dueDate")}</TableHead>
               <TableHead>{t("amountDue")}</TableHead>
+              <TableHead className="text-end">{t("nextDueColumn")}</TableHead>
               <TableHead className="text-end">{t("settlePayment")}</TableHead>
             </TableRow>
           </TableHeader>
@@ -223,6 +224,18 @@ export function PaymentRuleTable({
                       <span className="ms-1.5 whitespace-nowrap text-xs font-bold text-accent-foreground">
                         · {t("paidSoFar")} {row.totalAmountPaid} MAD
                       </span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-end whitespace-nowrap">
+                    {row.nextDueDate ? (
+                      <span className="text-sm">
+                        {row.nextDueDate}
+                        {row.nextDueRemaining > 0
+                          ? ` · ${row.nextDueRemaining} MAD`
+                          : " · " + t("advanceApplied")}
+                      </span>
+                    ) : (
+                      "—"
                     )}
                   </TableCell>
                   <TableCell className="text-end whitespace-nowrap">
@@ -344,6 +357,15 @@ export function PaymentRuleTable({
                 <p className="mt-1 text-xs font-bold text-accent-foreground">
                   {t("paidSoFar")} : {row.totalAmountPaid} MAD ·{" "}
                   {t("remainingAmount")} : {row.totalRemaining} MAD
+                </p>
+              )}
+              {row.nextDueDate && (
+                <p className="mt-1 text-xs text-accent-foreground/80">
+                  <span className="font-medium">{t("nextDueColumn")} :</span>{" "}
+                  {row.nextDueDate}{" "}
+                  {row.nextDueRemaining > 0
+                    ? `· ${row.nextDueRemaining} MAD`
+                    : `· ${t("advanceApplied")}`}
                 </p>
               )}
               {note && <PaymentNoteLine note={note} />}

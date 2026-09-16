@@ -758,6 +758,9 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     // this student+subject, in dueDate-ascending order — due AND future.
     // Surplus that can't be absorbed rolls forward month by month; any still
     // unabsorbed credit becomes advanceBalance on the student record.
+    // Context is required so applyCreditWaterfall's subjectProration is
+    // populated (cross-subject proration map) — without it the waterfall
+    // falls back to plain gap-filling and Rules A-D are skipped.
     const { updated, remaining, anyChanged } = applyCreditWaterfall(
       paymentsNow,
       studentId,
@@ -765,6 +768,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       Math.round(amount),
       asOfKey,
       updatedAt,
+      { student, sessions: get().sessions, prices: get().prices },
     );
 
     if (!anyChanged) return;

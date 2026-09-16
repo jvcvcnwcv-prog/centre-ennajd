@@ -112,13 +112,26 @@ function SettlementBadge({
   info,
   t,
 }: {
-  info?: { count: number; remaining: number };
+  info?: {
+    count: number;
+    dueInstallmentCount: number;
+    remaining: number;
+  };
   t: (key: string) => string;
 }) {
   if (!info || info.count === 0) {
     return (
       <Badge variant="outline" className="rounded-full text-muted-foreground">
         —
+      </Badge>
+    );
+  }
+  // Rule A single-session skip: installments exist (future/autoPaid) but
+  // NO current-month installment is due yet → show dash, not "Payé".
+  if (info.dueInstallmentCount === 0) {
+    return (
+      <Badge variant="outline" className="rounded-full text-muted-foreground">
+        -
       </Badge>
     );
   }
@@ -194,23 +207,35 @@ export function StudentTable({ students, onEdit, emptyState }: StudentTableProps
   // - Extra "حصة إضافية" sessions (isExtra:true / kind==="one_off") are already
   //   excluded at generation time in ennajd-billing.ts and never reach this table.
   // - Partial payments are netted via getPaymentRemaining (amountDue - amountPaid).
+  // - `dueInstallmentCount` tracks ALL due installments (paid or not) to distinguish
+  //   Rule A single-session skip (no current-month installment) from fully-paid.
   const settlementByStudent = useMemo(() => {
     const todayKey = formatDateKey(new Date());
-    const map = new Map<string, { count: number; remaining: number }>();
+    const map = new Map<
+      string,
+      { count: number; dueInstallmentCount: number; remaining: number }
+    >();
     for (const payment of payments) {
-      const entry = map.get(payment.studentId) ?? { count: 0, remaining: 0 };
+      const entry = map.get(payment.studentId) ?? {
+        count: 0,
+        dueInstallmentCount: 0,
+        remaining: 0,
+      };
       entry.count += 1;
-      // Explicit future exclusion: only past-due installments count toward Reste
-            // Use isPaymentFullyPaid for consistency with aggregateOverdueInstallments /
-            // getDueBalanceForStudentSubject — an installment counts as owed only when
-            // neither the isPaid flag nor amountPaid covers amountDue.
-            if (payment.dueDate <= todayKey) {
-              // Only unpaid installments contribute; getPaymentRemaining is partial-aware
-              if (!isPaymentFullyPaid(payment)) {
-                const remaining = getPaymentRemaining(payment);
-                if (remaining > 0) entry.remaining += remaining;
-              }
-            }
+      // Count ALL due installments (paid or not) — needed to distinguish
+      // Rule A single-session skip (no due installment this month) from a
+      // fully-paid student.
+      if (payment.dueDate <= todayKey) {
+        entry.dueInstallmentCount += 1;
+        // Explicit future exclusion: only past-due installments count toward Reste
+        // Use isPaymentFullyPaid for consistency with aggregateOverdueInstallments /\
+        // getDueBalanceForStudentSubject — an installment counts as owed only when
+        // neither the isPaid flag nor amountPaid covers amountDue.
+        if (!isPaymentFullyPaid(payment)) {
+          const remaining = getPaymentRemaining(payment);
+          if (remaining > 0) entry.remaining += remaining;
+        }
+      }
       map.set(payment.studentId, entry);
     }
     // Subtract each student's advanceBalance (cross-subject credit carried

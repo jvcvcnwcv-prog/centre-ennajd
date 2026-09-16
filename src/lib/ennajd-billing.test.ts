@@ -2,8 +2,23 @@
 // Run with: npx vitest run src/lib/ennajd-billing.test.ts
 
 import { describe, it, expect } from "vitest";
-import { applyCreditWaterfall, isPaymentFullyPaid } from "./ennajd-billing";
+import { applyCreditWaterfall, generateRuleASchedule, isPaymentFullyPaid } from "./ennajd-billing";
 import type { Payment, Subject } from "../types/ennajd";
+
+// Helper to build a DeliveredDatesContext for testing generateRuleASchedule.
+// `hasSession=true` means standard sessions on the given weekdays; the count
+// function counts how many of those fall in a date range.
+function makeCtx(opts: {
+  hasSession?: boolean;
+  scheduledDaysOfWeek?: number[];
+  fallbackDayOfWeek?: number;
+}) {
+  return {
+    hasSession: opts.hasSession ?? true,
+    scheduledDaysOfWeek: opts.scheduledDaysOfWeek ?? [],
+    fallbackDayOfWeek: opts.fallbackDayOfWeek ?? 1,
+  };
+}
 
 const SUBJECT: Subject = "PC";
 const RULE: Payment["rule"] = "A";
@@ -160,5 +175,118 @@ describe("applyCreditWaterfall", () => {
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rule A — generateRuleASchedule
+// ---------------------------------------------------------------------------
+
+describe("generateRuleASchedule — Rule A single-session skip", () => {
+  // A 2x/week subject (e.g. PC) has 8 standard sessions in a full month
+  // (4 weeks × 2 days). We simulate a student joining on day 6 of January
+  // (a Thursday) when sessions run on Monday + Thursday (day 1 and 4).
+  // Jan 2025: Mon=6, Thu=9, Mon=13, Thu=16, Mon=20, Thu=23, Mon=27, Thu=30
+  // Joining on Jan 6 (Monday) → remaining Mon+Thu from Jan 6..31 = 8 sessions.
+  // Joining on Jan 28 (Monday) → remaining = 2 (Mon 27 is before the 28th,
+  //   Thu 30, Mon ... no). Let's use a cleaner setup:
+  //
+  // Setup: student joins mid-month such that exactly 1 standard session
+  // remains. Use a 1x/week schedule (sessions on Wednesdays) in Jan 2025:
+  // Wednesdays = Jan 1, 8, 15, 22, 29.
+  // If enrolledAt = Jan 29 (last Wednesday), remaining = 1 (just Jan 29).
+  const WED_CTX = makeCtx({
+    hasSession: true,
+    scheduledDaysOfWeek: [3], // Wednesday
+    fallbackDayOfWeek: 3,
+  });
+
+  it("single remaining session → NO Month 1 installment, 100% autoPaid to next month", () => {
+    // Jan 29 2025 is a Wednesday. Sessions on Wednesdays in Jan 2025:
+    // Jan 1(wed), 8, 15, 22, 29 → 5 total.
+    // enrolledAt = Jan 29 → remaining from Jan 29..31 = 1 (Jan 29).
+    // total = 5.
+    // asOf = Feb 15 2025.
+    const enrolledAt = new Date(2025, 0, 29); // Jan 29
+    const asOf = new Date(2025, 1, 15); // Feb 15
+
+    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
+
+    // Should NOT have a Month-1 installment on enrolledAt (Jan 29).
+    const month1 = schedule.find((s) => s.dueDate.getTime() === enrolledAt.getTime());
+    expect(month1).toBeUndefined();
+
+    // Should have exactly ONE autoPaid installment on Feb 1 (nextMonthDue)
+    // with amountRatio 1.
+    const nextMonth = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 1, 1).getTime());
+    expect(nextMonth).toBeDefined();
+    expect(nextMonth!.amountRatio).toBe(1);
+    expect(nextMonth!.autoPaid).toBe(true);
+    expect(nextMonth!.isHalfMonth).toBe(false);
+
+    // No other installments — Feb 1 is the only one within asOf window.
+    expect(schedule.filter((s) => s.dueDate.getTime() <= asOf.getTime())).toHaveLength(1);
+  });
+
+  it("single remaining session with asOf far in future → autoPaid Feb + full-price March onward", () => {
+    const enrolledAt = new Date(2025, 0, 29); // Jan 29, one remaining session
+    const asOf = new Date(2025, 4, 15); // May 15
+
+    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
+
+    // Feb 1: autoPaid (100% pre-pay)
+    const feb1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 1, 1).getTime());
+    expect(feb1).toBeDefined();
+    expect(feb1!.autoPaid).toBe(true);
+    expect(feb1!.amountRatio).toBe(1);
+
+    // Mar 1 onward: regular full-price, NOT autoPaid
+    const mar1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 2, 1).getTime());
+    expect(mar1).toBeDefined();
+    expect(mar1!.autoPaid).toBe(false);
+    expect(mar1!.amountRatio).toBe(1);
+
+    const apr1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 3, 1).getTime());
+    expect(apr1).toBeDefined();
+    expect(apr1!.autoPaid).toBe(false);
+    expect(apr1!.amountRatio).toBe(1);
+
+    const may1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 4, 1).getTime());
+    expect(may1).toBeDefined();
+    expect(may1!.autoPaid).toBe(false);
+
+    // Total: Feb + Mar + Apr + May = 4 installments
+    const dueInWindow = schedule.filter((s) => s.dueDate.getTime() <= asOf.getTime());
+    expect(dueInWindow).toHaveLength(4);
+  });
+
+  it("single remaining session with asOf before next month → empty array", () => {
+    // enrolledAt Jan 29, asOf same day → nextMonthDue (Feb 1) > asOf → no installments
+    const enrolledAt = new Date(2025, 0, 29);
+    const asOf = new Date(2025, 0, 29);
+
+    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
+    expect(schedule).toHaveLength(0);
+  });
+
+  it("does NOT trigger when remaining is 2 (still uses Late-Join tier, not Rule A skip)", () => {
+    // Jan 22 (Wednesday), sessions on Wednesdays: 1, 8, 15, 22, 29
+    // enrolledAt Jan 22 → remaining Jan 22..31 = Jan 22 + Jan 29 = 2.
+    // remaining === 2 → falls into Tier 1 (Late-Join: autoPaid Month 1 + next month),
+    // NOT Rule A skip. Month 1 installment ON enrolledAt should exist.
+    const enrolledAt = new Date(2025, 0, 22); // Jan 22
+    const asOf = new Date(2025, 1, 15); // Feb 15
+
+    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
+
+    // Month 1 installment on enrolledAt (Jan 22) should exist → NOT skipped
+    const month1 = schedule.find((s) => s.dueDate.getTime() === enrolledAt.getTime());
+    expect(month1).toBeDefined();
+    expect(month1!.autoPaid).toBe(false); // Tier 1 creates unpaid Month 1
+
+    // Feb 1: autoPaid (Late-Join bonus credit)
+    const feb1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 1, 1).getTime());
+    expect(feb1).toBeDefined();
+    expect(feb1!.autoPaid).toBe(true);
   });
 });

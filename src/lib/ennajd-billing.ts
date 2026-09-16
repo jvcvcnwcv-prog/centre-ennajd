@@ -180,10 +180,6 @@ export function generateRuleASchedule(
 ): ScheduledInstallment[] {
   if (enrolledAt > asOf) return [];
 
-  const results: ScheduledInstallment[] = [
-    { dueDate: enrolledAt, isHalfMonth: false, amountRatio: 1, autoPaid: false },
-  ];
-
   const monthStart = startOfMonth(enrolledAt);
   const monthEnd = new Date(
     monthStart.getFullYear(),
@@ -192,10 +188,36 @@ export function generateRuleASchedule(
   );
   const nextMonthDue = addMonthsClamped(monthStart, 1); // 1st of next month
 
-  if (nextMonthDue > asOf) return results;
-
   const remaining = countOccurrencesInRange(ctx, enrolledAt, monthEnd);
   const total = countOccurrencesInRange(ctx, monthStart, monthEnd);
+
+  // Rule A — Single Session Skip Exception: exactly 1 remaining session
+  // → DO NOT charge current month (leave EMPTY/BLANK — display as '-').
+  // Apply 100% of tuition to next month's installment (autoPaid: true).
+  if (remaining === 1) {
+    if (nextMonthDue > asOf) return [];
+    const results: ScheduledInstallment[] = [
+      {
+        dueDate: nextMonthDue,
+        isHalfMonth: false,
+        amountRatio: 1,
+        autoPaid: true,
+      },
+    ];
+    let next = addMonthsClamped(nextMonthDue, 1);
+    while (next <= asOf) {
+      results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+      next = addMonthsClamped(next, 1);
+    }
+    return results;
+  }
+
+  // Default: Month 1 full fee upfront on the join date.
+  const results: ScheduledInstallment[] = [
+    { dueDate: enrolledAt, isHalfMonth: false, amountRatio: 1, autoPaid: false },
+  ];
+
+  if (nextMonthDue > asOf) return results;
 
   // Dynamic half check: exactly half of standard monthly sessions (2/4, 4/8, 3/6, etc.)
   const isExactlyHalf = total > 0 && remaining * 2 === total;

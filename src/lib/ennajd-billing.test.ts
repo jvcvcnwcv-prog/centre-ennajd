@@ -142,8 +142,10 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
   });
 
   it("charges 75% when 3 of 4 sessions remain (3/4)", () => {
+    // Exclusive window: the enrollment-date session is excluded, so join the
+    // day BEFORE a Wednesday (Jan 14, Tue) → 15, 22, 29 remain = 3.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 15), // Jan 15 (Wednesday) → 15, 22, 29 remain
+      new Date(2025, 0, 14), // Jan 14 (Tuesday) → Jan 15, 22, 29 remain
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
@@ -153,8 +155,9 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
   });
 
   it("charges 50% when 2 of 4 sessions remain (2/4)", () => {
+    // Join Jan 21 (Tue) → sessions strictly after: 22, 29 = 2.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 22), // Jan 22 (Wednesday) → 22, 29 remain
+      new Date(2025, 0, 21), // Jan 21 (Tuesday) → 22, 29 remain
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
@@ -164,14 +167,28 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
   });
 
   it("charges nothing when a single session remains (1/4 → FREE)", () => {
+    // Join Jan 28 (Tue) → only Jan 29 remains → billable 1 → FREE.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 29), // Jan 29 (last Wednesday) → 1 remains
+      new Date(2025, 0, 28), // Jan 28 (Tuesday) → 29 only remains
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
     );
     expect(schedule.find((s) => s.monthKey === "2025-01")).toBeUndefined();
     // The next month is still billed in full.
+    expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(400);
+  });
+
+  it("emits no installment when the join date leaves zero sessions", () => {
+    // Joining ON the last Wednesday (Jan 29) → nothing strictly after it in
+    // January → zero occurrences → no installment for the join month.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 29),
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")).toBeUndefined();
     expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(400);
   });
 
@@ -253,14 +270,15 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
   });
 
   it("rounds per-session amounts to whole MAD", () => {
-    // price 300 with fixedCount 4 → perSession 75 → 3 sessions = 225.
+    // price 300 with fixedCount 4 → perSession 75 → 2 sessions = 150.
+    // Joining Jan 15 (Wed) excludes the 15th → 22, 29 remain.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 15), // 3 sessions remain
+      new Date(2025, 0, 15), // 2 sessions remain (22, 29)
       new Date(2025, 1, 15),
       WED_CTX,
       300,
     );
-    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(225);
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(150);
   });
 });
 
@@ -279,9 +297,10 @@ describe("generateSessionBasedSchedule — 2x/week subject (fixedCount = 8)", ()
   });
 
   it("charges 50% when 4 of 8 sessions remain (4/8)", () => {
-    // Joining Jan 20 (Monday): Mon 20, 27 + Thu 23, 30 = 4 remain.
+    // Exclusive window: join Jan 18 (Sat) → sessions strictly after it are
+    // Mon 20, 27 + Thu 23, 30 = 4 remain.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 20),
+      new Date(2025, 0, 18),
       new Date(2025, 2, 15),
       MON_THU_CTX,
       PRICE_2X,
@@ -303,9 +322,10 @@ describe("generateSessionBasedSchedule — 2x/week subject (fixedCount = 8)", ()
   });
 
   it("charges nothing when only 1 session remains in the join month", () => {
-    // Joining Jan 30 (Thursday): only Thu 30 remains → billable 1 → FREE.
+    // Exclusive window: joining Jan 29 (Wed) → only Thu 30 remains →
+    // billable 1 → FREE (Rule 4 still applies under the new window).
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 30),
+      new Date(2025, 0, 29),
       new Date(2025, 1, 15),
       MON_THU_CTX,
       PRICE_2X,
@@ -327,14 +347,16 @@ describe("computeExpectedMonthAmount", () => {
   });
 
   it("prorates a mid-month join", () => {
+    // Exclusive window: join Jan 21 (Tue) → 22, 29 remain = 2 sessions.
     expect(
-      computeExpectedMonthAmount(new Date(2025, 0, 22), "2025-01", WED_CTX, PRICE),
+      computeExpectedMonthAmount(new Date(2025, 0, 21), "2025-01", WED_CTX, PRICE),
     ).toBe(200);
   });
 
   it("returns null for the join month with a single session left", () => {
+    // Join Jan 28 (Tue) → only Jan 29 remains → free.
     expect(
-      computeExpectedMonthAmount(new Date(2025, 0, 29), "2025-01", WED_CTX, PRICE),
+      computeExpectedMonthAmount(new Date(2025, 0, 28), "2025-01", WED_CTX, PRICE),
     ).toBeNull();
   });
 
@@ -392,7 +414,7 @@ describe("Rule B — 2Bac s.x Small", () => {
   it("generateScheduleFor routes Rule A vs Rule B", () => {
     const ruleA = generateScheduleFor(
       "A",
-      new Date(2025, 0, 22),
+      new Date(2025, 0, 21), // join Jan 21 (Tue) → 22, 29 remain
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
@@ -651,7 +673,8 @@ describe("reconcileRuleALedger", () => {
   });
 
   it("updates a mid-month-join row to the prorated amount", () => {
-    // Joined Jan 15 (Wednesday) → 3 of 4 sessions remain → 300, not 400.
+    // Joined Jan 15 (Wednesday) — the 15th session itself is excluded, so
+    // only 22 + 29 remain = 2 of 4 sessions → 200, not 400.
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "Math", "2025-01-15", 400, 0, false),
     ];
@@ -662,7 +685,7 @@ describe("reconcileRuleALedger", () => {
       prices,
     );
     expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([{ id: "p1", amountDue: 300, isPaid: false }]);
+    expect(result.update).toEqual([{ id: "p1", amountDue: 200, isPaid: false }]);
   });
 });
 
@@ -772,5 +795,143 @@ describe("applyCreditWaterfall", () => {
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec regression — T.C Math 350 DH · Mardi+Jeudi 19:00 · enrolled 2026-09-15
+// ---------------------------------------------------------------------------
+// Sept 2026: 2026-09-01 is a Tuesday → Tuesdays 1, 8, 15, 22, 29 (5) +
+// Thursdays 3, 10, 17, 24 (4). fixedCount = 4 × 2 = 8,
+// perSession = 350 / 8 = 43.75.
+// The enrollment-date session (Tue 15) is NOT billable → sessions strictly
+// after 15/09 = Thu 17, Tue 22, Thu 24, Tue 29 = 4 → 4 × 43.75 = 175 DH.
+// (Buggy inclusive counting gave 5 sessions = 219 DH.)
+
+describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15", () => {
+  const TUE_THU_CTX = makeCtx({ scheduledDaysOfWeek: [2, 4] }); // Mardi + Jeudi
+  const PRICE_350 = 350;
+  const ENROLLED = new Date(2026, 8, 15); // 2026-09-15 (Tuesday)
+  const SPEC_NOW = "2026-11-15T12:00:00.000Z";
+
+  it("bills Sept 2026 at 175 DH (4 sessions × 43.75), due on the join date", () => {
+    expect(getFixedSessionCount(TUE_THU_CTX)).toBe(8);
+    const schedule = generateSessionBasedSchedule(
+      ENROLLED,
+      new Date(2026, 10, 15), // through Nov 2026
+      TUE_THU_CTX,
+      PRICE_350,
+    );
+    const sept = schedule.find((s) => s.monthKey === "2026-09");
+    expect(sept).toBeDefined();
+    expect(sept!.amount).toBe(175);
+    expect(sept!.dueDate).toBe("2026-09-15");
+  });
+
+  it("bills Oct 2026 at the full 350 DH (9 occurrences capped at 8), due on the 1st", () => {
+    const schedule = generateSessionBasedSchedule(
+      ENROLLED,
+      new Date(2026, 10, 15),
+      TUE_THU_CTX,
+      PRICE_350,
+    );
+    const oct = schedule.find((s) => s.monthKey === "2026-10");
+    expect(oct).toBeDefined();
+    expect(oct!.amount).toBe(350);
+    expect(oct!.dueDate).toBe("2026-10-01");
+  });
+
+  it("resumes 350 DH on the 1st of each following month", () => {
+    const schedule = generateSessionBasedSchedule(
+      ENROLLED,
+      new Date(2026, 10, 15),
+      TUE_THU_CTX,
+      PRICE_350,
+    );
+    const nov = schedule.find((s) => s.monthKey === "2026-11");
+    expect(nov).toBeDefined();
+    expect(nov!.amount).toBe(350);
+    expect(nov!.dueDate).toBe("2026-11-01");
+  });
+
+  it("computeExpectedMonthAmount(\"2026-09\") = 175", () => {
+    expect(
+      computeExpectedMonthAmount(ENROLLED, "2026-09", TUE_THU_CTX, PRICE_350),
+    ).toBe(175);
+    expect(
+      computeExpectedMonthAmount(ENROLLED, "2026-10", TUE_THU_CTX, PRICE_350),
+    ).toBe(350);
+  });
+
+  it("charges nothing when joining on 24/09 (Thu) — only the 29/09 session remains", () => {
+    // Rule 4 still applies under the exclusive window.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2026, 8, 24),
+      new Date(2026, 10, 15),
+      TUE_THU_CTX,
+      PRICE_350,
+    );
+    expect(schedule.find((s) => s.monthKey === "2026-09")).toBeUndefined();
+    expect(schedule.find((s) => s.monthKey === "2026-10")!.amount).toBe(350);
+  });
+
+  it("settles Sept and pre-pays half of Oct when 350 DH is paid at registration", () => {
+    // applyInitialTuitionPayment generates Sept (175, due 15/09) + Oct (350,
+    // due 01/10) + Nov (350, due 01/11), then runs applyCreditWaterfall(350).
+    const payments: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 175),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350),
+      makePayment("nov", STUDENT_ID, "Math", "2026-11-01", 350),
+    ];
+
+    const result = applyCreditWaterfall(
+      payments,
+      STUDENT_ID,
+      null, // cross-subject mode (creation-time waterfall)
+      350,
+      "2026-09-15",
+      SPEC_NOW,
+    );
+
+    // Sept absorbs 175 → fully paid / green.
+    const sept = result.updated.find((p) => p.id === "sept");
+    expect(sept).toBeDefined();
+    expect(sept!.amountPaid).toBe(175);
+    expect(isPaymentFullyPaid(sept!)).toBe(true);
+
+    // Oct absorbs the 175 surplus → 175 paid so far, still due 175.
+    const oct = result.updated.find((p) => p.id === "oct");
+    expect(oct).toBeDefined();
+    expect(oct!.amountPaid).toBe(175);
+    expect(oct!.amountDue).toBe(350);
+    expect(isPaymentFullyPaid(oct!)).toBe(false);
+
+    // Nov untouched, and no orphan credit → advanceBalance stays 0.
+    expect(result.updated.find((p) => p.id === "nov")).toBeUndefined();
+    expect(result.remaining).toBe(0);
+  });
+
+  it("fully pays Oct with a follow-up 175 DH partial payment on 15/10", () => {
+    const payments: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 175, 175, true),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 175, false),
+      makePayment("nov", STUDENT_ID, "Math", "2026-11-01", 350),
+    ];
+
+    const result = applyCreditWaterfall(
+      payments,
+      STUDENT_ID,
+      "Math",
+      175,
+      "2026-10-15",
+      SPEC_NOW,
+    );
+
+    const oct = result.updated.find((p) => p.id === "oct");
+    expect(oct).toBeDefined();
+    expect(oct!.amountPaid).toBe(350); // 175 + 175 = 350
+    expect(isPaymentFullyPaid(oct!)).toBe(true);
+    expect(result.remaining).toBe(0); // nothing left over
+    expect(result.updated.find((p) => p.id === "nov")).toBeUndefined();
   });
 });

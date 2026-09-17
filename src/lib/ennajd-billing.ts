@@ -16,9 +16,11 @@
 //    count. Extra "حصة إضافية" (one_off) is 100% free, excluded from the count.
 // 3. Attendance vs Billing: a scheduled standard class = CONSUMED SESSION
 //    even if absent. Attendance is tracking only.
-// 4. Join month: only sessions from enrolledAt → month-end count. When the
-//    student joins with ≤1 billable session left, that single session is
-//    FREE (no installment emitted for the join month).
+// 4. Join month: only sessions STRICTLY AFTER enrolledAt → month-end count
+//    (the enrollment-date session itself is not billable — billing starts
+//    with the next scheduled session). When the student joins with ≤1
+//    billable session left, that single session is FREE (no installment
+//    emitted for the join month).
 // 5. Months before enrollment / months with zero scheduled occurrences (gap
 //    months) / combos with no timetable: NO installment ("–").
 // 6. Reste guard: dueDate <= today only, future auto-generated sessions excluded.
@@ -78,6 +80,13 @@ function startOfMonth(date: Date): Date {
 
 function normalizeDateOnly(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+/** The calendar day strictly after `date` (date-only, +1 day). */
+function dayAfter(date: Date): Date {
+  const next = normalizeDateOnly(date);
+  next.setDate(next.getDate() + 1);
+  return next;
 }
 
 /**
@@ -214,8 +223,11 @@ function computeMonthBillable(
     monthDate.getFullYear() === enrolledAt.getFullYear() &&
     monthDate.getMonth() === enrolledAt.getMonth();
 
+  // Join month: sessions STRICTLY AFTER enrolledAt (exclusive start) — the
+  // enrollment-date session itself is never billed. Other months count the
+  // full calendar month.
   const count = isJoinMonth
-    ? countOccurrencesInRange(ctx, enrolledAt, monthEnd)
+    ? countOccurrencesInRange(ctx, dayAfter(enrolledAt), monthEnd)
     : countOccurrencesInRange(ctx, monthStart, monthEnd);
 
   // A month with zero scheduled occurrences is a gap month too.
@@ -231,8 +243,10 @@ function computeMonthBillable(
 
 /**
  * Expected installment amount (MAD) for one calendar month, using the
- * session-based formula: perSession × billable sessions. Returns `null`
- * when no installment should exist for that month (see computeMonthBillable).
+ * session-based formula: perSession × billable sessions. The join month
+ * counts only the sessions STRICTLY AFTER `enrolledAt` (the
+ * enrollment-date session is excluded). Returns `null` when no installment
+ * should exist for that month (see computeMonthBillable).
  *
  * `price` is the monthly fee for this student+subject (already resolved with
  * customPrice by the caller). Pure — used both by the generator and by
@@ -262,7 +276,8 @@ export function computeExpectedMonthAmount(
  * month through `asOf`, emits one installment whose amount is
  * perSession × (sessions the student will attend that month):
  *
- *  - join month: occurrences in [enrolledAt, month-end],
+ *  - join month: occurrences in (enrolledAt, month-end] — strictly AFTER the
+ *    enrollment date (the enrollment-date session is not billable),
  *  - other months: occurrences in the full month,
  *  - billable capped at fixedCount (a 5th weekly occurrence is free),
  *  - join month with ≤1 session left → free (no installment),

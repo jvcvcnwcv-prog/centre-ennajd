@@ -16,11 +16,11 @@ import {
   buildDeliveredDatesContext,
   dedupePayments,
   formatDateKey,
-  formatMonthKey,
   generateScheduleFor,
   getPaymentRuleFor,
   isPaymentFullyPaid,
   getPaymentRemaining,
+  reconcilePaymentAmounts,
   REGISTRATION_FEE_DEFAULT,
   type DeliveredDatesContext,
 } from "@/lib/ennajd-billing";
@@ -133,6 +133,7 @@ interface EnnajdState {
     totalPaid: number,
     asOf: Date,
   ) => Promise<void>;
+  regeneratePaymentLedger: () => Promise<boolean>;
   setSubjectPaymentNote: (
     studentId: string,
     subject: Subject,
@@ -288,24 +289,24 @@ function generateInstallmentsForStudent(
       ctxCache.set(ctxKey, ctx);
     }
 
-    const schedule = generateScheduleFor(rule, enrolledAt, asOf, ctx);
+    // Session-based engine (Rule A) / rolling cycle (Rule B): the schedule
+    // already carries ABSOLUTE amounts (perSession × billable sessions),
+    // resolved from getEffectivePrice (which honors customPrice).
+    const schedule = generateScheduleFor(rule, enrolledAt, asOf, ctx, fullPrice);
     for (const installment of schedule) {
-      const dueDateKey = formatDateKey(installment.dueDate);
-      const key = `${student.id}__${enrollment.subject}__${dueDateKey}`;
+      const key = `${student.id}__${enrollment.subject}__${installment.dueDate}`;
       if (existingKeys.has(key)) continue;
       existingKeys.add(key);
       generated.push({
         id: makeId(),
         studentId: student.id,
         subject: enrollment.subject,
-        dueDate: dueDateKey,
-        month: formatMonthKey(installment.dueDate),
-        isPaid: installment.autoPaid,
-        amountDue: Math.round(fullPrice * installment.amountRatio),
-        amountPaid: installment.autoPaid
-          ? Math.round(fullPrice * installment.amountRatio)
-          : 0,
-        isHalfMonth: installment.isHalfMonth,
+        dueDate: installment.dueDate,
+        month: installment.monthKey,
+        isPaid: false,
+        amountDue: installment.amount,
+        amountPaid: 0,
+        isHalfMonth: false,
         rule,
         updatedAt,
       });
@@ -789,7 +790,6 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
           prevAdvanceBalance,
           todayKey,
           now.toISOString(),
-          { student, sessions: get().sessions, prices: get().prices },
         );
 
         if (updated.length > 0) {
@@ -811,6 +811,43 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
           });
         }
       }
+    }
+
+    // SELF-HEAL: recompute stale Rule A amounts (price/timetable edits,
+    // engine migration). Rule B and customPrice rows are never touched; a
+    // row stays paid only when amountPaid covers the NEW amountDue. Patches
+    // are merged into the same outgoing batch as generated installments.
+    // Reads the CURRENT ledger so advance-credit patches applied in the loop
+    // above are preserved on the reconciled rows.
+    const currentPayments = get().payments;
+    const reconcilePatches = reconcilePaymentAmounts(
+      currentPayments,
+      get().students,
+      get().sessions,
+      get().prices,
+    );
+    if (reconcilePatches.length > 0) {
+      const reconcileById = new Map(
+        reconcilePatches.map((p) => [p.id, p]),
+      );
+      for (const patch of reconcilePatches) {
+        const existing = currentPayments.find((p) => p.id === patch.id);
+        if (!existing) continue;
+        newPayments.push({
+          ...existing,
+          amountDue: patch.amountDue,
+          isPaid: patch.isPaid,
+          updatedAt: now.toISOString(),
+        });
+      }
+      set((s) => ({
+        payments: s.payments.map((p) => {
+          const patch = reconcileById.get(p.id);
+          return patch
+            ? { ...p, amountDue: patch.amountDue, isPaid: patch.isPaid, updatedAt: now.toISOString() }
+            : p;
+        }),
+      }));
     }
 
     if (newPayments.length === 0) return;
@@ -904,9 +941,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       // this student+subject, in dueDate-ascending order — due AND future.
       // Surplus that can't be absorbed rolls forward month by month; any still
       // unabsorbed credit becomes advanceBalance on the student record.
-      // Context is required so applyCreditWaterfall's subjectProration is
-      // populated (cross-subject proration map) — without it the waterfall
-      // falls back to plain gap-filling and Rules A-D are skipped.
+      // With session-based pricing the installment amounts are exact, so the
+      // waterfall is plain dueDate-ascending gap-filling.
       const { updated, remaining, anyChanged } = applyCreditWaterfall(
         paymentsNow,
         studentId,
@@ -914,7 +950,6 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         Math.round(amount),
         asOfKey,
         updatedAt,
-        { student, sessions: get().sessions, prices: get().prices },
       );
 
       if (anyChanged) {
@@ -1101,8 +1136,6 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
       updatedAt,
     );
 
-    const context = { student, sessions: get().sessions, prices: get().prices };
-
     try {
       // Persist generated installments BEFORE running the waterfall so the
       // DB and local state stay consistent. Awaited (not void-fired) so a
@@ -1126,7 +1159,6 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
         Math.round(totalPaid),
         asOfKey,
         updatedAt,
-        context,
       );
 
       if (!anyChanged) return;
@@ -1162,6 +1194,88 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
       set({ payments: previousPayments, students: previousStudents });
       toast.error(t("paymentSaveFailed"));
       throw err;
+    }
+  },
+
+  /**
+   * Manual "recalculate installments" action — deletes every Rule A row and
+   * rebuilds it from scratch with the session-based engine, keeping Rule B
+   * rows untouched. Used to settle old balances immediately after a price or
+   * timetable change, without waiting for the daily `syncPayments` self-heal.
+   *
+   * Payment progress is preserved per (student, subject, month): the amount
+   * already paid on the deleted rows of that month is carried onto the
+   * rebuilt row (capped at the new amountDue), and `isPaid` is recomputed
+   * strictly from that paid amount.
+   *
+   * Optimistic local update (snapshot + rollback on failure). Callers ask
+   * the user to confirm first — the whole Rule A ledger is rewritten.
+   */
+  regeneratePaymentLedger: async () => {
+    if (!get().hasSyncedPayments) return false;
+
+    const previousPayments = get().payments;
+    const previousStudents = get().students;
+
+    // Keep every Rule B row; the Rule A rows are fully rebuilt.
+    const keptPayments = previousPayments.filter((p) => p.rule !== "A");
+    const deletedRuleA = previousPayments.filter((p) => p.rule === "A");
+
+    // Paid progress per (student, subject, month), so a rebuilt row for the
+    // same month keeps what was already paid on the deleted rows.
+    const paidByMonth = new Map<string, number>();
+    for (const p of deletedRuleA) {
+      const key = `${p.studentId}__${p.subject}__${p.month}`;
+      paidByMonth.set(key, (paidByMonth.get(key) ?? 0) + (p.amountPaid ?? 0));
+    }
+
+    const now = new Date();
+    const updatedAt = now.toISOString();
+    const todayKey = formatDateKey(now);
+    const generateThrough = new Date(now);
+    generateThrough.setMonth(generateThrough.getMonth() + 1);
+
+    const existingKeys = new Set(
+      keptPayments.map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
+    );
+    const rebuilt: Payment[] = [];
+    for (const student of get().students) {
+      const generated = generateInstallmentsForStudent(
+        student,
+        generateThrough,
+        todayKey,
+        existingKeys,
+        updatedAt,
+      );
+      for (const payment of generated) {
+        // Only genuinely-missing rows are generated (existingKeys dedupes the
+        // kept Rule B rows). Restore the prior payment progress for that month.
+        const paidKey = `${payment.studentId}__${payment.subject}__${payment.month}`;
+        const carriedPaid = Math.min(paidByMonth.get(paidKey) ?? 0, payment.amountDue);
+        rebuilt.push(
+          carriedPaid > 0
+            ? { ...payment, amountPaid: carriedPaid, isPaid: carriedPaid >= payment.amountDue }
+            : payment,
+        );
+      }
+    }
+
+    const nextPayments = [...keptPayments, ...rebuilt];
+    set({ payments: nextPayments });
+
+    try {
+      if (deletedRuleA.length > 0) {
+        await deletePaymentsBatchDoc(deletedRuleA.map((p) => p.id));
+      }
+      if (rebuilt.length > 0) {
+        await upsertPaymentsBatchDoc(rebuilt);
+      }
+      return true;
+    } catch (err) {
+      console.error("[ennajd] regeneratePaymentLedger failed:", err);
+      set({ payments: previousPayments, students: previousStudents });
+      toast.error(t("paymentSaveFailed"));
+      return false;
     }
   },
 

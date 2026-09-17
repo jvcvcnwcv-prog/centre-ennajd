@@ -147,6 +147,10 @@ const dictionary = {
     reportGenerator: "Rapports",
     reportGeneratorSubtitle:
       "Sélectionnez un niveau, une matière et un mois : le rapport regroupe automatiquement toutes les séances correspondantes sur le mois entier.",
+    recalculateInstallments: "Recalculer les échéances",
+    recalculateInstallmentsConfirm:
+      "Toutes les échéances Rule A vont être supprimées et reconstruites à partir du moteur de tarification par séance (prix unitaire × séances réellement suivies). Les paiements déjà enregistrés sont conservés. Continuer ?",
+    installmentsRecalculated: "Échéances recalculées",
     chooseLevel: "1. Choisir le niveau",
     chooseTrack: "2. Choisir la filière",
     chooseSubject: "3. Choisir la matière",
@@ -530,6 +534,10 @@ const dictionary = {
     reportGenerator: "التقارير",
     reportGeneratorSubtitle:
       "اختر المستوى والمادة والشهر: يجمع التقرير تلقائيًا جميع الحصص المطابقة على مدار الشهر كاملاً.",
+    recalculateInstallments: "إعادة حساب الأقساط",
+    recalculateInstallmentsConfirm:
+      "سيتم حذف جميع أقساط القاعدة A وإعادة بنائها بمحرك التسعير بالحصة (ثمن الحصة × عدد الحصص الفعلية). المدفوعات المسجلة مسبقًا تُحفظ. هل تريد المتابعة؟",
+    installmentsRecalculated: "تمت إعادة حساب الأقساط",
     chooseLevel: "١. اختر المستوى",
     chooseTrack: "٢. اختر الشعبة",
     chooseSubject: "٣. اختر المادة",

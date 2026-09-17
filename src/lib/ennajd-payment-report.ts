@@ -5,7 +5,11 @@
 // — Takhfid (custom pricing) is therefore automatically correct.
 
 import { sortStudentsAlphabetically, type AcademicMonth } from "@/lib/ennajd-report-shared";
-import type { Payment, Student, Subject } from "@/types/ennajd";
+import {
+  buildDeliveredDatesContext,
+  computeExpectedMonthAmount,
+} from "@/lib/ennajd-billing";
+import type { Payment, Session, Student, Subject } from "@/types/ennajd";
 
 export interface PaymentCell {
   amountDue: number;
@@ -38,6 +42,13 @@ export interface PaymentMatrix {
  * session (all students in this roster share the same group type, since
  * the roster is pinned to a single Session) — used only to flag
  * custom-discounted (Takhfid) installments, never to recompute amounts.
+ *
+ * The `isDiscounted` flag compares each month's frozen `amountDue` against
+ * the amount the session-based engine EXPECTS for that month at the BASE
+ * price (`computeExpectedMonthAmount`). Legitimately prorated months (a
+ * mid-month join) match their expected amount and carry no flag; the flag
+ * appears only when a real `customPrice` moved the amount off the base
+ * expectation.
  */
 export function buildPaymentMatrix(
   students: Student[],
@@ -45,6 +56,7 @@ export function buildPaymentMatrix(
   subject: Subject,
   months: AcademicMonth[],
   basePrice: number | undefined,
+  sessions: Session[],
 ): PaymentMatrix {
   const sortedStudents = sortStudentsAlphabetically(students);
 
@@ -56,6 +68,32 @@ export function buildPaymentMatrix(
     const studentPayments = payments.filter(
       (p) => p.studentId === student.id && p.subject === subject,
     );
+
+    // Expected amounts are derived from the student's own enrollment + the
+    // combo's timetable, so a mid-month join is recognized as full-price or
+    // prorated rather than "discounted".
+    const enrollment = student.enrollments.find((e) => e.subject === subject);
+    const expectedByMonth = new Map<string, number | null>();
+    if (enrollment && basePrice !== undefined) {
+      const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+      const ctx = buildDeliveredDatesContext(
+        sessions,
+        [],
+        {
+          level: student.level,
+          subject,
+          track: enrollment.track,
+          groupType: enrollment.groupType,
+        },
+        enrolledAt,
+      );
+      for (const month of months) {
+        expectedByMonth.set(
+          month.key,
+          computeExpectedMonthAmount(enrolledAt, month.key, ctx, basePrice),
+        );
+      }
+    }
 
     for (const month of months) {
       const monthPayments = studentPayments.filter((p) => p.month === month.key);
@@ -74,12 +112,13 @@ export function buildPaymentMatrix(
       );
       const isPartiallyPaid = !isPaid && amountPaid > 0;
       const isHalfMonth = monthPayments.some((p) => p.isHalfMonth);
+      // Only a genuine customPrice (or a stale row) moves the amount off the
+      // base-price expectation — a prorated join month matches and stays unflagged.
+      const expected = expectedByMonth.get(month.key);
       const isDiscounted =
-        basePrice !== undefined &&
-        monthPayments.some((p) => {
-          const expected = p.isHalfMonth ? Math.round(basePrice / 2) : basePrice;
-          return p.amountDue !== expected;
-        });
+        basePrice !== undefined && expected !== null && expected !== undefined
+          ? amountDue !== expected
+          : false;
 
       cellsByMonth.set(month.key, {
         amountDue,

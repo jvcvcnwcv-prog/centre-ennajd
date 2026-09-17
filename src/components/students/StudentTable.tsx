@@ -126,8 +126,8 @@ function SettlementBadge({
       </Badge>
     );
   }
-  // Rule A single-session skip: installments exist (future/autoPaid) but
-  // NO current-month installment is due yet → show dash, not "Payé".
+  // Installments exist (e.g. strictly-future ones) but NO installment is due
+  // yet → show a dash, not "Payé".
   if (info.dueInstallmentCount === 0) {
     return (
       <Badge variant="outline" className="rounded-full text-muted-foreground">

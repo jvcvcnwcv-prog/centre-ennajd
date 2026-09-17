@@ -1105,7 +1105,7 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
       track: options.track,
       groupType: options.groupType,
     });
-    const matrix = buildPaymentMatrix(roster, options.payments, options.subject, months, options.basePrice);
+    const matrix = buildPaymentMatrix(roster, options.payments, options.subject, months, options.basePrice, options.sessions);
     const yearLabel = `${months[0].year}-${months[months.length - 1].year}`;
     const chunks = chunkRows(matrix.rows, REPORT_ROWS_PER_PAGE);
     const pageChunks: typeof chunks = chunks.length > 0 ? chunks : [[]];

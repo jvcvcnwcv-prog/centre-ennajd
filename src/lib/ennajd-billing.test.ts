@@ -1,19 +1,24 @@
-// Unit tests for the advance-credit waterfall.
+// Unit tests for the session-based pricing engine.
 // Run with: npx vitest run src/lib/ennajd-billing.test.ts
 
 import { describe, it, expect } from "vitest";
 import {
   applyCreditWaterfall,
-  formatMonthKey,
-  generateRuleASchedule,
+  buildDeliveredDatesContext,
+  computeExpectedMonthAmount,
+  generateRuleBSchedule,
+  generateScheduleFor,
+  generateSessionBasedSchedule,
+  getFixedSessionCount,
   getPaymentRuleFor,
   isPaymentFullyPaid,
-  isProratedSubject,
+  reconcilePaymentAmounts,
 } from "./ennajd-billing";
 import type {
   GroupType,
   Level,
   Payment,
+  PriceEntry,
   Session,
   Student,
   Subject,
@@ -21,78 +26,27 @@ import type {
   Track,
 } from "../types/ennajd";
 
-// Helper to build a DeliveredDatesContext for testing generateRuleASchedule.
-// `hasSession=true` means standard sessions on the given weekdays; the count
-// function counts how many of those fall in a date range. `gapMonthKeys`
-// marks Rule D gap months (zero standard scheduled occurrences).
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const STUDENT_ID = "student-1";
+const NOW = "2025-01-15T12:00:00.000Z";
+const PRICE = 400; // monthly fee for a 1x/week subject → perSession = 100
+
+/** Noontime ISO so local-calendar fields are stable in any timezone. */
+const NOON = "T12:00:00.000Z";
+
 function makeCtx(opts: {
   hasSession?: boolean;
   scheduledDaysOfWeek?: number[];
-  fallbackDayOfWeek?: number;
   gapMonthKeys?: ReadonlySet<string>;
 }) {
   return {
     hasSession: opts.hasSession ?? true,
     scheduledDaysOfWeek: opts.scheduledDaysOfWeek ?? [],
-    fallbackDayOfWeek: opts.fallbackDayOfWeek ?? 1,
+    fallbackDayOfWeek: 0,
     gapMonthKeys: opts.gapMonthKeys ?? new Set<string>(),
-  };
-}
-
-const SUBJECT: Subject = "PC";
-const RULE: Payment["rule"] = "A";
-const NOW = "2025-01-15T00:00:00Z";
-const AS_OF = "2025-01-15";
-
-function makePayment(
-  id: string,
-  studentId: string,
-  subject: Subject,
-  dueDate: string,
-  amountDue: number,
-  amountPaid = 0,
-  isPaid = false,
-): Payment {
-  return {
-    id,
-    studentId,
-    subject,
-    dueDate,
-    month: dueDate.slice(0, 7),
-    isPaid,
-    amountDue,
-    amountPaid,
-    isHalfMonth: false,
-    rule: RULE,
-    updatedAt: NOW,
-  };
-}
-
-const STUDENT_ID = "student-1";
-
-// --- Proration test fixtures (Rules A-D + 2BAC Small exemption) ---
-
-/** Noontime ISO so local-calendar fields are stable in any timezone. */
-const NOON = "T12:00:00.000Z";
-
-function makeStudent(opts: {
-  id?: string;
-  level?: Level;
-  track?: Track | null;
-  enrollments: SubjectEnrollment[];
-  advanceBalance?: number;
-}): Student {
-  return {
-    id: opts.id ?? STUDENT_ID,
-    firstName: "Test",
-    lastName: "Student",
-    whatsappPhone: "",
-    parentPhone: "",
-    level: opts.level ?? "T.C",
-    track: opts.track ?? null,
-    enrollments: opts.enrollments,
-    createdAt: "2025-01-01T00:00:00.000Z",
-    advanceBalance: opts.advanceBalance,
   };
 }
 
@@ -117,55 +71,505 @@ function makeRecurringSession(
   };
 }
 
+function makeStudent(opts: {
+  id?: string;
+  level?: Level;
+  track?: Track | null;
+  enrollments: SubjectEnrollment[];
+  advanceBalance?: number;
+}): Student {
+  return {
+    id: opts.id ?? STUDENT_ID,
+    firstName: "Test",
+    lastName: "Student",
+    whatsappPhone: "",
+    parentPhone: "",
+    level: opts.level ?? "T.C",
+    track: opts.track ?? null,
+    enrollments: opts.enrollments,
+    createdAt: "2025-01-01T00:00:00.000Z",
+    advanceBalance: opts.advanceBalance,
+  };
+}
+
+function makePayment(
+  id: string,
+  studentId: string,
+  subject: Subject,
+  dueDate: string,
+  amountDue: number,
+  amountPaid = 0,
+  isPaid = false,
+  rule: Payment["rule"] = "A",
+): Payment {
+  return {
+    id,
+    studentId,
+    subject,
+    dueDate,
+    month: dueDate.slice(0, 7),
+    isPaid,
+    amountDue,
+    amountPaid,
+    isHalfMonth: false,
+    rule,
+    updatedAt: NOW,
+  };
+}
+
+// January 2025 Wednesdays: 1, 8, 15, 22, 29 (5 occurrences).
+// February 2025 Wednesdays: 5, 12, 19, 26 (4 occurrences).
+const WED_CTX = makeCtx({ scheduledDaysOfWeek: [3] });
+
+// ---------------------------------------------------------------------------
+// Session-based pricing — core formula
+// ---------------------------------------------------------------------------
+
+describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", () => {
+  it("charges the full price when joining at the start of the month (4/4)", () => {
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 1), // Jan 1 (Wednesday)
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    const jan = schedule.find((s) => s.monthKey === "2025-01");
+    expect(jan).toBeDefined();
+    expect(jan!.amount).toBe(400);
+    // Join-month installment is due on the enrollment date itself.
+    expect(jan!.dueDate).toBe("2025-01-01");
+  });
+
+  it("charges 75% when 3 of 4 sessions remain (3/4)", () => {
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 15), // Jan 15 (Wednesday) → 15, 22, 29 remain
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    const jan = schedule.find((s) => s.monthKey === "2025-01");
+    expect(jan!.amount).toBe(300);
+  });
+
+  it("charges 50% when 2 of 4 sessions remain (2/4)", () => {
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 22), // Jan 22 (Wednesday) → 22, 29 remain
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    const jan = schedule.find((s) => s.monthKey === "2025-01");
+    expect(jan!.amount).toBe(200);
+  });
+
+  it("charges nothing when a single session remains (1/4 → FREE)", () => {
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 29), // Jan 29 (last Wednesday) → 1 remains
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")).toBeUndefined();
+    // The next month is still billed in full.
+    expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(400);
+  });
+
+  it("bills the 5th occurrence of a month for FREE (invoice stays 400)", () => {
+    // January 2025 has 5 Wednesdays; joining Jan 1 → 5 occurrences but
+    // billable is capped at fixedCount = 4 → full price, 5th is free.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 1),
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(400);
+  });
+
+  it("charges full price for complete later months, due on the 1st", () => {
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 15),
+      new Date(2025, 2, 15), // through March
+      WED_CTX,
+      PRICE,
+    );
+    const feb = schedule.find((s) => s.monthKey === "2025-02");
+    expect(feb!.amount).toBe(400);
+    expect(feb!.dueDate).toBe("2025-02-01");
+    const mar = schedule.find((s) => s.monthKey === "2025-03");
+    expect(mar!.amount).toBe(400);
+    expect(mar!.dueDate).toBe("2025-03-01");
+  });
+
+  it("emits no installment for months before the enrollment date", () => {
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 1, 5), // joins in February
+      new Date(2025, 2, 15),
+      WED_CTX,
+      PRICE,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")).toBeUndefined();
+    expect(schedule.find((s) => s.monthKey === "2025-02")).toBeDefined();
+  });
+
+  it("emits nothing for a subject with no timetable", () => {
+    expect(
+      generateSessionBasedSchedule(
+        new Date(2025, 0, 1),
+        new Date(2025, 2, 15),
+        makeCtx({ hasSession: false, scheduledDaysOfWeek: [] }),
+        PRICE,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("emits nothing for a gap month (zero scheduled occurrences)", () => {
+    const ctx = makeCtx({
+      scheduledDaysOfWeek: [3],
+      gapMonthKeys: new Set(["2025-02"]),
+    });
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 1),
+      new Date(2025, 2, 15),
+      ctx,
+      PRICE,
+    );
+    const monthKeys = schedule.map((s) => s.monthKey);
+    expect(monthKeys).not.toContain("2025-02");
+    expect(monthKeys).toContain("2025-01");
+    expect(monthKeys).toContain("2025-03");
+  });
+
+  it("respects customPrice in the computation", () => {
+    // Same 4/4 join, but the student's effective price is 300 (Takhfid).
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 1),
+      new Date(2025, 1, 15),
+      WED_CTX,
+      300,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(300);
+  });
+
+  it("rounds per-session amounts to whole MAD", () => {
+    // price 300 with fixedCount 4 → perSession 75 → 3 sessions = 225.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 15), // 3 sessions remain
+      new Date(2025, 1, 15),
+      WED_CTX,
+      300,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(225);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2x/week subject — fixedCount = 8
+// ---------------------------------------------------------------------------
+
+describe("generateSessionBasedSchedule — 2x/week subject (fixedCount = 8)", () => {
+  // January 2025 Mondays: 6, 13, 20, 27. Thursdays: 2, 9, 16, 23, 30 → 9 total.
+  const MON_THU_CTX = makeCtx({ scheduledDaysOfWeek: [1, 4] });
+  const PRICE_2X = 800; // perSession = 100
+
+  it("computes fixedCount = 8 for two scheduled days", () => {
+    expect(getFixedSessionCount(MON_THU_CTX)).toBe(8);
+    expect(getFixedSessionCount(WED_CTX)).toBe(4);
+  });
+
+  it("charges 50% when 4 of 8 sessions remain (4/8)", () => {
+    // Joining Jan 20 (Monday): Mon 20, 27 + Thu 23, 30 = 4 remain.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 20),
+      new Date(2025, 2, 15),
+      MON_THU_CTX,
+      PRICE_2X,
+    );
+    const jan = schedule.find((s) => s.monthKey === "2025-01");
+    expect(jan!.amount).toBe(400); // 4 × 100
+  });
+
+  it("caps a 9-occurrence month at 8 (full price)", () => {
+    // Joining Jan 1 (Wednesday, but sessions are Mon+Thu): occurrences from
+    // Jan 1..31 = 9 (5 Thu + 4 Mon) → capped at 8 → 800.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 1),
+      new Date(2025, 1, 15),
+      MON_THU_CTX,
+      PRICE_2X,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(800);
+  });
+
+  it("charges nothing when only 1 session remains in the join month", () => {
+    // Joining Jan 30 (Thursday): only Thu 30 remains → billable 1 → FREE.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2025, 0, 30),
+      new Date(2025, 1, 15),
+      MON_THU_CTX,
+      PRICE_2X,
+    );
+    expect(schedule.find((s) => s.monthKey === "2025-01")).toBeUndefined();
+    expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(800);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeExpectedMonthAmount
+// ---------------------------------------------------------------------------
+
+describe("computeExpectedMonthAmount", () => {
+  it("matches the schedule for a full-month join", () => {
+    expect(
+      computeExpectedMonthAmount(new Date(2025, 0, 1), "2025-01", WED_CTX, PRICE),
+    ).toBe(400);
+  });
+
+  it("prorates a mid-month join", () => {
+    expect(
+      computeExpectedMonthAmount(new Date(2025, 0, 22), "2025-01", WED_CTX, PRICE),
+    ).toBe(200);
+  });
+
+  it("returns null for the join month with a single session left", () => {
+    expect(
+      computeExpectedMonthAmount(new Date(2025, 0, 29), "2025-01", WED_CTX, PRICE),
+    ).toBeNull();
+  });
+
+  it("returns null for months before enrollment", () => {
+    expect(
+      computeExpectedMonthAmount(new Date(2025, 2, 1), "2025-01", WED_CTX, PRICE),
+    ).toBeNull();
+  });
+
+  it("returns null for a subject with no timetable", () => {
+    expect(
+      computeExpectedMonthAmount(
+        new Date(2025, 0, 1),
+        "2025-01",
+        makeCtx({ hasSession: false, scheduledDaysOfWeek: [] }),
+        PRICE,
+      ),
+    ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rule B — 2Bac s.x Small rolling cycle
+// ---------------------------------------------------------------------------
+
+describe("Rule B — 2Bac s.x Small", () => {
+  it("keeps Math/PC/SVT 2Bac s.x Small on the rolling Rule B cycle", () => {
+    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.x")).toBe("B");
+    expect(getPaymentRuleFor("2Bac", "PC", "Small", "s.x")).toBe("B");
+    expect(getPaymentRuleFor("2Bac", "SVT", "Small", "s.x")).toBe("B");
+  });
+
+  it("keeps other combos on Rule A (session-based)", () => {
+    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.m")).toBe("A");
+    expect(getPaymentRuleFor("2Bac", "Math", "Large", "s.x")).toBe("A");
+    expect(getPaymentRuleFor("T.C", "Math", "Large", null)).toBe("A");
+  });
+
+  it("bills the full price on the join day and every month on the same day", () => {
+    const schedule = generateRuleBSchedule(
+      new Date(2025, 0, 12), // joins Jan 12
+      new Date(2025, 3, 15),
+      500,
+    );
+    expect(schedule).toHaveLength(4); // Jan 12, Feb 12, Mar 12, Apr 12
+    expect(schedule.map((s) => s.dueDate)).toEqual([
+      "2025-01-12",
+      "2025-02-12",
+      "2025-03-12",
+      "2025-04-12",
+    ]);
+    expect(schedule.every((s) => s.amount === 500)).toBe(true);
+  });
+
+  it("generateScheduleFor routes Rule A vs Rule B", () => {
+    const ruleA = generateScheduleFor(
+      "A",
+      new Date(2025, 0, 22),
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    expect(ruleA.find((s) => s.monthKey === "2025-01")!.amount).toBe(200);
+
+    const ruleB = generateScheduleFor(
+      "B",
+      new Date(2025, 0, 12),
+      new Date(2025, 1, 15),
+      WED_CTX,
+      PRICE,
+    );
+    expect(ruleB.map((s) => s.dueDate)).toContain("2025-02-12");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildDeliveredDatesContext — one_off sessions are free, combos are matched
+// ---------------------------------------------------------------------------
+
+describe("buildDeliveredDatesContext", () => {
+  it("collects standard recurring days and ignores one_off sessions", () => {
+    const sessions: Session[] = [
+      makeRecurringSession("Math", "T.C", null, "Large", 3),
+      {
+        ...makeRecurringSession("Math", "T.C", null, "Large", 5),
+        kind: "one_off" as const,
+        date: "2025-01-10",
+      },
+    ];
+    const ctx = buildDeliveredDatesContext(sessions, [], {
+      level: "T.C",
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+    }, new Date(2025, 0, 1));
+    expect(ctx.hasSession).toBe(true);
+    expect(ctx.scheduledDaysOfWeek).toEqual([3]); // one_off excluded
+    expect(getFixedSessionCount(ctx)).toBe(4);
+  });
+
+  it("reports no session for a combo without a timetable", () => {
+    const ctx = buildDeliveredDatesContext(
+      [makeRecurringSession("PC", "T.C", null, "Large", 3)],
+      [],
+      { level: "T.C", subject: "Math", track: null, groupType: "Large" },
+      new Date(2025, 0, 1),
+    );
+    expect(ctx.hasSession).toBe(false);
+    expect(ctx.scheduledDaysOfWeek).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcilePaymentAmounts — daily self-heal
+// ---------------------------------------------------------------------------
+
+describe("reconcilePaymentAmounts", () => {
+  const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
+  const prices: PriceEntry[] = [
+    {
+      id: "price-1",
+      level: "T.C",
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      price: PRICE,
+    },
+  ];
+
+  function ledgerStudent(customPrice?: number): Student {
+    const enrollment: SubjectEnrollment = {
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      enrolledAt: `2025-01-01${NOON}`,
+    };
+    if (customPrice !== undefined) enrollment.customPrice = customPrice;
+    return makeStudent({
+      level: "T.C",
+      enrollments: [enrollment],
+    });
+  }
+
+  it("corrects a stale Rule A amount and clears a false isPaid", () => {
+    // Full-month join should be 400; the frozen row still says 320 (stale)
+    // and is marked paid with 320 paid — the new amountDue 400 is not covered.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 320, true),
+    ];
+    const patches = reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices);
+    expect(patches).toHaveLength(1);
+    expect(patches[0].id).toBe("p1");
+    expect(patches[0].amountDue).toBe(400);
+    expect(patches[0].isPaid).toBe(false); // 320 < 400
+  });
+
+  it("keeps isPaid = true only when amountPaid covers the new amount", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 400, true),
+    ];
+    const patches = reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices);
+    expect(patches[0].amountDue).toBe(400);
+    expect(patches[0].isPaid).toBe(true); // 400 >= 400
+  });
+
+  it("leaves correct rows untouched", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    expect(
+      reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices),
+    ).toHaveLength(0);
+  });
+
+  it("never touches Rule B rows", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 999, 0, false, "B"),
+    ];
+    expect(
+      reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices),
+    ).toHaveLength(0);
+  });
+
+  it("respects customPrice when recomputing", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const patches = reconcilePaymentAmounts(
+      payments,
+      [ledgerStudent(300)],
+      sessions,
+      prices,
+    );
+    expect(patches[0].amountDue).toBe(300);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyCreditWaterfall — plain dueDate-ascending gap filling
+// ---------------------------------------------------------------------------
+
 describe("applyCreditWaterfall", () => {
   it("distributes credit across current + future installments (surplus rolls forward)", () => {
-    // 3 installments: current (due Jan), next month (Feb), two months (Mar)
-    // credit = 500 → current 300 cleared, next cleared (300), third gets 200 of 400
+    // 3 installments: 300 + 300 + 400 = 1000 of gaps; credit = 500 clears
+    // p1 (300) and p2 (200 of its 300), leaving p3 untouched.
     const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, SUBJECT, "2025-01-01", 300),
-      makePayment("p2", STUDENT_ID, SUBJECT, "2025-02-01", 300),
-      makePayment("p3", STUDENT_ID, SUBJECT, "2025-03-01", 400),
+      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
+      makePayment("p2", STUDENT_ID, "PC", "2025-02-01", 300),
+      makePayment("p3", STUDENT_ID, "PC", "2025-03-01", 400),
     ];
 
-    const result = applyCreditWaterfall(payments, STUDENT_ID, SUBJECT, 500, AS_OF, NOW);
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 500, "2025-01-15", NOW);
 
     expect(result.remaining).toBe(0);
     expect(result.anyChanged).toBe(true);
-    // p1 fully paid (300)
-    const p1 = result.updated.find((p) => p.id === "p1");
-    expect(p1?.amountPaid).toBe(300);
-    expect(isPaymentFullyPaid(p1!)).toBe(true);
-    // p2 fully paid (300 from the 200 remaining)
-    const p2 = result.updated.find((p) => p.id === "p2");
-    expect(p2?.amountPaid).toBe(300);
-    expect(isPaymentFullyPaid(p2!)).toBe(true);
-    // p3 partially paid (200 of 400)
-    const p3 = result.updated.find((p) => p.id === "p3");
-    expect(p3?.amountPaid).toBe(200);
-    expect(isPaymentFullyPaid(p3!)).toBe(false);
+    expect(result.updated.find((p) => p.id === "p1")!.amountPaid).toBe(300);
+    expect(isPaymentFullyPaid(result.updated.find((p) => p.id === "p1")!)).toBe(true);
+    expect(result.updated.find((p) => p.id === "p2")!.amountPaid).toBe(200);
+    expect(isPaymentFullyPaid(result.updated.find((p) => p.id === "p2")!)).toBe(false);
+    expect(result.updated.find((p) => p.id === "p3")).toBeUndefined();
   });
 
   it("stores surplus as remaining when credit exceeds all installment gaps", () => {
-    // 1 installment: current month amountDue=300, credit=700
-    // → installment settled, remaining=400 (must become advanceBalance)
     const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, SUBJECT, "2025-01-01", 300),
+      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
     ];
-
-    const result = applyCreditWaterfall(payments, STUDENT_ID, SUBJECT, 700, AS_OF, NOW);
-
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 700, "2025-01-15", NOW);
     expect(result.remaining).toBe(400);
-    expect(result.anyChanged).toBe(true);
-    const p1 = result.updated[0];
-    expect(isPaymentFullyPaid(p1)).toBe(true);
-    expect(p1.amountPaid).toBe(300);
+    expect(isPaymentFullyPaid(result.updated[0])).toBe(true);
   });
 
   it("returns zero credit input unchanged", () => {
     const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, SUBJECT, "2025-01-01", 300),
+      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
     ];
-    const result = applyCreditWaterfall(payments, STUDENT_ID, SUBJECT, 0, AS_OF, NOW);
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 0, "2025-01-15", NOW);
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(0);
     expect(result.anyChanged).toBe(false);
@@ -173,21 +577,19 @@ describe("applyCreditWaterfall", () => {
 
   it("handles negative / NaN credit gracefully", () => {
     const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, SUBJECT, "2025-01-01", 300),
+      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
     ];
-    const result = applyCreditWaterfall(payments, STUDENT_ID, SUBJECT, -50, AS_OF, NOW);
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", -50, "2025-01-15", NOW);
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(0);
   });
 
   it("respects subject filter (cross-subject mode with subject=null)", () => {
-    // Two subjects for same student — subject=null should scan both
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
       makePayment("p2", STUDENT_ID, "Math", "2025-01-01", 200),
     ];
-    // 400 credit in cross-subject mode → clears both
-    const result = applyCreditWaterfall(payments, STUDENT_ID, null, 400, AS_OF, NOW);
+    const result = applyCreditWaterfall(payments, STUDENT_ID, null, 400, "2025-01-15", NOW);
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(2);
   });
@@ -197,35 +599,29 @@ describe("applyCreditWaterfall", () => {
       makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
       makePayment("p2", STUDENT_ID, "Math", "2025-01-01", 200),
     ];
-    // 400 credit scoped to PC only → clears PC, 100 remaining
-    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 400, AS_OF, NOW);
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 400, "2025-01-15", NOW);
     expect(result.remaining).toBe(100);
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p1");
   });
 
   it("sorts by dueDate ascending before applying", () => {
-    // Unsorted input — later dueDate first
     const payments: Payment[] = [
-      makePayment("p2", STUDENT_ID, SUBJECT, "2025-02-01", 300),
-      makePayment("p1", STUDENT_ID, SUBJECT, "2025-01-01", 300),
+      makePayment("p2", STUDENT_ID, "PC", "2025-02-01", 300),
+      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
     ];
-    // 300 credit → should clear p1 (Jan), not p2 (Feb)
-    const result = applyCreditWaterfall(payments, STUDENT_ID, SUBJECT, 300, AS_OF, NOW);
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 300, "2025-01-15", NOW);
     expect(result.remaining).toBe(0);
-    const p1 = result.updated.find((p) => p.id === "p1");
-    expect(p1?.amountPaid).toBe(300);
-    // p2 should NOT be in updated
+    expect(result.updated.find((p) => p.id === "p1")!.amountPaid).toBe(300);
     expect(result.updated.find((p) => p.id === "p2")).toBeUndefined();
   });
 
   it("skips already-fully-paid installments", () => {
     const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, SUBJECT, "2025-01-01", 300, 300, true),
-      makePayment("p2", STUDENT_ID, SUBJECT, "2025-02-01", 300),
+      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300, 300, true),
+      makePayment("p2", STUDENT_ID, "PC", "2025-02-01", 300),
     ];
-    const result = applyCreditWaterfall(payments, STUDENT_ID, SUBJECT, 100, AS_OF, NOW);
-    // p1 is fully paid → skip, apply 100 to p2
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 100, "2025-01-15", NOW);
     expect(result.remaining).toBe(200);
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p2");
@@ -234,351 +630,12 @@ describe("applyCreditWaterfall", () => {
 
   it("respects studentId filter", () => {
     const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, SUBJECT, "2025-01-01", 300),
-      makePayment("p2", "other-student", SUBJECT, "2025-01-01", 300),
+      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
+      makePayment("p2", "other-student", "PC", "2025-01-01", 300),
     ];
-    const result = applyCreditWaterfall(payments, STUDENT_ID, SUBJECT, 300, AS_OF, NOW);
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 300, "2025-01-15", NOW);
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p1");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Rule A — generateRuleASchedule
-// ---------------------------------------------------------------------------
-
-describe("generateRuleASchedule — Rule A single-session skip", () => {
-  // A 2x/week subject (e.g. PC) has 8 standard sessions in a full month
-  // (4 weeks × 2 days). We simulate a student joining on day 6 of January
-  // (a Thursday) when sessions run on Monday + Thursday (day 1 and 4).
-  // Jan 2025: Mon=6, Thu=9, Mon=13, Thu=16, Mon=20, Thu=23, Mon=27, Thu=30
-  // Joining on Jan 6 (Monday) → remaining Mon+Thu from Jan 6..31 = 8 sessions.
-  // Joining on Jan 28 (Monday) → remaining = 2 (Mon 27 is before the 28th,
-  //   Thu 30, Mon ... no). Let's use a cleaner setup:
-  //
-  // Setup: student joins mid-month such that exactly 1 standard session
-  // remains. Use a 1x/week schedule (sessions on Wednesdays) in Jan 2025:
-  // Wednesdays = Jan 1, 8, 15, 22, 29.
-  // If enrolledAt = Jan 29 (last Wednesday), remaining = 1 (just Jan 29).
-  const WED_CTX = makeCtx({
-    hasSession: true,
-    scheduledDaysOfWeek: [3], // Wednesday
-    fallbackDayOfWeek: 3,
-  });
-
-  it("single remaining session → NO Month 1 installment, 100% autoPaid to next month", () => {
-    // Jan 29 2025 is a Wednesday. Sessions on Wednesdays in Jan 2025:
-    // Jan 1(wed), 8, 15, 22, 29 → 5 total.
-    // enrolledAt = Jan 29 → remaining from Jan 29..31 = 1 (Jan 29).
-    // total = 5.
-    // asOf = Feb 15 2025.
-    const enrolledAt = new Date(2025, 0, 29); // Jan 29
-    const asOf = new Date(2025, 1, 15); // Feb 15
-
-    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
-
-    // Should NOT have a Month-1 installment on enrolledAt (Jan 29).
-    const month1 = schedule.find((s) => s.dueDate.getTime() === enrolledAt.getTime());
-    expect(month1).toBeUndefined();
-
-    // Should have exactly ONE autoPaid installment on Feb 1 (nextMonthDue)
-    // with amountRatio 1.
-    const nextMonth = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 1, 1).getTime());
-    expect(nextMonth).toBeDefined();
-    expect(nextMonth!.amountRatio).toBe(1);
-    expect(nextMonth!.autoPaid).toBe(true);
-    expect(nextMonth!.isHalfMonth).toBe(false);
-
-    // No other installments — Feb 1 is the only one within asOf window.
-    expect(schedule.filter((s) => s.dueDate.getTime() <= asOf.getTime())).toHaveLength(1);
-  });
-
-  it("single remaining session with asOf far in future → autoPaid Feb + full-price March onward", () => {
-    const enrolledAt = new Date(2025, 0, 29); // Jan 29, one remaining session
-    const asOf = new Date(2025, 4, 15); // May 15
-
-    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
-
-    // Feb 1: autoPaid (100% pre-pay)
-    const feb1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 1, 1).getTime());
-    expect(feb1).toBeDefined();
-    expect(feb1!.autoPaid).toBe(true);
-    expect(feb1!.amountRatio).toBe(1);
-
-    // Mar 1 onward: regular full-price, NOT autoPaid
-    const mar1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 2, 1).getTime());
-    expect(mar1).toBeDefined();
-    expect(mar1!.autoPaid).toBe(false);
-    expect(mar1!.amountRatio).toBe(1);
-
-    const apr1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 3, 1).getTime());
-    expect(apr1).toBeDefined();
-    expect(apr1!.autoPaid).toBe(false);
-    expect(apr1!.amountRatio).toBe(1);
-
-    const may1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 4, 1).getTime());
-    expect(may1).toBeDefined();
-    expect(may1!.autoPaid).toBe(false);
-
-    // Total: Feb + Mar + Apr + May = 4 installments
-    const dueInWindow = schedule.filter((s) => s.dueDate.getTime() <= asOf.getTime());
-    expect(dueInWindow).toHaveLength(4);
-  });
-
-  it("single remaining session with asOf before next month → empty array", () => {
-    // enrolledAt Jan 29, asOf same day → nextMonthDue (Feb 1) > asOf → no installments
-    const enrolledAt = new Date(2025, 0, 29);
-    const asOf = new Date(2025, 0, 29);
-
-    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
-    expect(schedule).toHaveLength(0);
-  });
-
-  it("does NOT trigger when remaining is 2 (still uses Late-Join tier, not Rule A skip)", () => {
-    // Jan 22 (Wednesday), sessions on Wednesdays: 1, 8, 15, 22, 29
-    // enrolledAt Jan 22 → remaining Jan 22..31 = Jan 22 + Jan 29 = 2.
-    // remaining === 2 → falls into Tier 1 (Late-Join: autoPaid Month 1 + next month),
-    // NOT Rule A skip. Month 1 installment ON enrolledAt should exist.
-    const enrolledAt = new Date(2025, 0, 22); // Jan 22
-    const asOf = new Date(2025, 1, 15); // Feb 15
-
-    const schedule = generateRuleASchedule(enrolledAt, asOf, WED_CTX);
-
-    // Month 1 installment on enrolledAt (Jan 22) should exist → NOT skipped
-    const month1 = schedule.find((s) => s.dueDate.getTime() === enrolledAt.getTime());
-    expect(month1).toBeDefined();
-    expect(month1!.autoPaid).toBe(false); // Tier 1 creates unpaid Month 1
-
-    // Feb 1: autoPaid (Late-Join bonus credit)
-    const feb1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 1, 1).getTime());
-    expect(feb1).toBeDefined();
-    expect(feb1!.autoPaid).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Rule D — gap months in generateRuleASchedule
-// ---------------------------------------------------------------------------
-
-describe("generateRuleASchedule — Rule D gap months", () => {
-  it("emits NO installment for a month with zero standard scheduled occurrences", () => {
-    // Combo not scheduled at all → every month has 0 occurrences → no debt.
-    const ctx = makeCtx({
-      hasSession: true,
-      scheduledDaysOfWeek: [],
-      fallbackDayOfWeek: 3,
-    });
-    const schedule = generateRuleASchedule(
-      new Date(2025, 0, 8),
-      new Date(2025, 4, 15),
-      ctx,
-    );
-    expect(schedule).toHaveLength(0);
-  });
-
-  it("skips an explicitly-marked gap month and resumes the next month", () => {
-    // Wednesday combo; March 2025 is a term break (gap month). Joining Jan 8
-    // 2025 (Wednesday) with 4/5 sessions remaining → custom tier (M2 ratio
-    // 4/5 on Feb 1), then full months from March onward — except March,
-    // which emits nothing.
-    const ctx = makeCtx({
-      hasSession: true,
-      scheduledDaysOfWeek: [3], // Wednesday
-      fallbackDayOfWeek: 3,
-      gapMonthKeys: new Set(["2025-03"]),
-    });
-    const schedule = generateRuleASchedule(
-      new Date(2025, 0, 8),
-      new Date(2025, 4, 15),
-      ctx,
-    );
-    const dueMonthKeys = schedule.map((s) => formatMonthKey(s.dueDate));
-
-    // March is skipped entirely — no installment, no debt.
-    expect(dueMonthKeys).not.toContain("2025-03");
-    // Surrounding months are still emitted.
-    expect(dueMonthKeys).toContain("2025-01");
-    expect(dueMonthKeys).toContain("2025-02");
-    expect(dueMonthKeys).toContain("2025-04");
-    expect(dueMonthKeys).toContain("2025-05");
-  });
-
-  it("skips gap months in the single-session-skip branch too", () => {
-    // 1 remaining session in the join month (Rule A skip of month 1), with
-    // April marked as a gap month.
-    const ctx = makeCtx({
-      hasSession: true,
-      scheduledDaysOfWeek: [3],
-      fallbackDayOfWeek: 3,
-      gapMonthKeys: new Set(["2025-04"]),
-    });
-    const schedule = generateRuleASchedule(
-      new Date(2025, 0, 29), // last Wednesday of Jan → 1 remaining
-      new Date(2025, 4, 15),
-      ctx,
-    );
-    const dueMonthKeys = schedule.map((s) => formatMonthKey(s.dueDate));
-    expect(dueMonthKeys).not.toContain("2025-04");
-    expect(dueMonthKeys).toContain("2025-02");
-    expect(dueMonthKeys).toContain("2025-03");
-    expect(dueMonthKeys).toContain("2025-05");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Waterfall Rules A-D + 2BAC Small exemption
-// ---------------------------------------------------------------------------
-
-describe("applyCreditWaterfall — Rule A join-month-only skip", () => {
-  it("skips the join-month installment but credits a LATER month (scope fix)", () => {
-    // 1x/week Wednesday combo; student joins Jan 29 2025 (Wednesday) →
-    // exactly 1 standard session remains in the join month → Rule A skip,
-    // scoped to "2025-01" only.
-    const student = makeStudent({
-      level: "T.C",
-      enrollments: [
-        { subject: "Math", track: null, groupType: "Large", enrolledAt: `2025-01-29${NOON}` },
-      ],
-    });
-    const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-29", 1000), // join month
-      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 1000), // later month
-      makePayment("p3", STUDENT_ID, "Math", "2025-03-01", 1000), // later month
-    ];
-
-    const result = applyCreditWaterfall(payments, STUDENT_ID, "Math", 1500, "2025-02-15", NOW, {
-      student,
-      sessions,
-      prices: [],
-    });
-
-    // Join-month installment is untouched (Rule A skip).
-    expect(result.updated.find((p) => p.id === "p1")).toBeUndefined();
-    // Later months are still creditable (the scope fix): Feb cleared, Mar partial.
-    expect(result.updated.find((p) => p.id === "p2")?.amountPaid).toBe(1000);
-    expect(result.updated.find((p) => p.id === "p3")?.amountPaid).toBe(500);
-    expect(result.remaining).toBe(0);
-  });
-});
-
-describe("applyCreditWaterfall — Rule B partial month (once-per-subject budget)", () => {
-  it("caps current-month credit at round(credit * ratio) and rolls the surplus forward", () => {
-    // Join Jan 8 2025 (Wednesday) with 4 of 5 Wednesday sessions remaining →
-    // ratio 4/5. A 1000 MAD credit must put round(1000 * 0.8) = 800 on the
-    // current month and roll the 200 surplus to the next installment.
-    const student = makeStudent({
-      level: "T.C",
-      enrollments: [
-        { subject: "Math", track: null, groupType: "Large", enrolledAt: `2025-01-08${NOON}` },
-      ],
-    });
-    const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-08", 1000), // current month
-      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 1000), // future
-      makePayment("p3", STUDENT_ID, "Math", "2025-03-01", 1000), // future
-    ];
-
-    const result = applyCreditWaterfall(payments, STUDENT_ID, "Math", 1000, "2025-01-20", NOW, {
-      student,
-      sessions,
-      prices: [],
-    });
-
-    const p1 = result.updated.find((p) => p.id === "p1");
-    const p2 = result.updated.find((p) => p.id === "p2");
-    expect(p1?.amountPaid).toBe(800); // budget-capped, NOT the full 1000
-    expect(isPaymentFullyPaid(p1!)).toBe(false);
-    expect(p2?.amountPaid).toBe(200); // surplus rolled forward
-    expect(result.updated.find((p) => p.id === "p3")).toBeUndefined(); // nothing left
-    expect(result.remaining).toBe(0);
-    expect(result.currentMonthCredit).toBe(800);
-    expect(result.futureMonthCredit).toBe(200);
-  });
-});
-
-describe("applyCreditWaterfall — Rule C full month", () => {
-  it("applies 100% of credit to the current month when remaining === total", () => {
-    // Joined Jan 1 2025 (first Wednesday) → all 5 sessions remain → ratio 1.
-    const student = makeStudent({
-      level: "T.C",
-      enrollments: [
-        { subject: "Math", track: null, groupType: "Large", enrolledAt: `2025-01-01${NOON}` },
-      ],
-    });
-    const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 500), // current month
-      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 500), // future
-    ];
-
-    const result = applyCreditWaterfall(payments, STUDENT_ID, "Math", 500, "2025-01-20", NOW, {
-      student,
-      sessions,
-      prices: [],
-    });
-
-    const p1 = result.updated.find((p) => p.id === "p1");
-    expect(p1?.amountPaid).toBe(500);
-    expect(isPaymentFullyPaid(p1!)).toBe(true);
-    expect(result.updated.find((p) => p.id === "p2")).toBeUndefined();
-    expect(result.remaining).toBe(0);
-    expect(result.currentMonthCredit).toBe(500);
-    expect(result.futureMonthCredit).toBe(0);
-  });
-});
-
-describe("applyCreditWaterfall — 2BAC Small (P.G) exemption", () => {
-  const SMALL_2BAC_COMBOS: Array<{ subject: Subject; track: Track }> = [
-    { subject: "Math", track: "s.x" },
-    { subject: "PC", track: "s.x" },
-    { subject: "SVT", track: "s.x" },
-  ];
-
-  for (const { subject, track } of SMALL_2BAC_COMBOS) {
-    it(`falls back to plain gap-filling for 2Bac ${track} Small ${subject} (no proration)`, () => {
-      expect(getPaymentRuleFor("2Bac", subject, "Small", track)).toBe("B");
-
-      const student = makeStudent({
-        level: "2Bac",
-        track,
-        enrollments: [
-          { subject, track, groupType: "Small", enrolledAt: `2025-01-29${NOON}` },
-        ],
-      });
-      expect(isProratedSubject(student, subject)).toBe(false);
-
-      const sessions = [makeRecurringSession(subject, "2Bac", track, "Small", 3)];
-      const payments: Payment[] = [
-        makePayment("p1", STUDENT_ID, subject, "2025-01-29", 300), // current month
-        makePayment("p2", STUDENT_ID, subject, "2025-02-01", 300), // future
-      ];
-
-      const result = applyCreditWaterfall(payments, STUDENT_ID, subject, 400, "2025-02-15", NOW, {
-        student,
-        sessions,
-        prices: [],
-      });
-
-      // Plain gap-filling: the current month is NOT capped by any ratio — it
-      // is cleared outright and the surplus lands on the next installment.
-      expect(result.updated.find((p) => p.id === "p1")?.amountPaid).toBe(300);
-      expect(result.updated.find((p) => p.id === "p2")?.amountPaid).toBe(100);
-      expect(result.remaining).toBe(0);
-    });
-  }
-
-  it("a non-exempt 2Bac combo still prorates (s.m is not P.G)", () => {
-    const student = makeStudent({
-      level: "2Bac",
-      track: "s.m",
-      enrollments: [
-        { subject: "Math", track: "s.m", groupType: "Small", enrolledAt: `2025-01-29${NOON}` },
-      ],
-    });
-    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.m")).toBe("A");
-    expect(isProratedSubject(student, "Math")).toBe(true);
   });
 });

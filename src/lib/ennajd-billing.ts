@@ -1,22 +1,27 @@
-// Centre Ennajd payment engine — Rule A (standard classes, calendar-aligned,
-// with a mid-month-join auto-adjustment) and Rule B (2Bac s.x Small groups,
+// Centre Ennajd payment engine — Session-Based Pricing for Rule A
+// (standard classes: monthly fee ÷ fixed sessions × sessions the student
+// will actually attend that month) and Rule B (2Bac s.x Small groups,
 // rolling join-date cycle). Pure data/functions, zero React/Zustand —
 // mirrors the "Shield" pattern of ennajd-taxonomy.ts.
 // All functions take explicit Date params (enrolledAt/asOf), no hidden `new Date()`.
 //
 // BUSINESS RULES (strict implementation):
-// 1. Dynamic Pricing & Sessions per Subject/Level:
-//    monthlyFee and totalMonthlySessions vary by subject/level (1x/week=4/mois, 2x/week=8/mois).
-//    monthlyFee is pulled dynamically via PriceEntry/customPrice, totalMonthlySessions is
-//    the count of STANDARD scheduled occurrences in the calendar month.
-// 2. Standard vs Extra: ONLY standard/fixed sessions (kind !== "one_off") count.
-//    Extra "حصة إضافية" (kind==="one_off") is 100% free, excluded from tier thresholds & per-session rate.
-// 3. Attendance vs Billing: scheduled standard class = CONSUMED SESSION even if absent. Attendance is tracking only.
-// 4. Mid-Month Tiers (enrolledAt -> month-end, standard sessions only):
-//    - Late (<=2 remaining): those sessions FREE bonus, upfront full fee credited 100% to NEXT month (autoPaid).
-//    - Half (exactly half, e.g. 2/4 or 4/8): upfront full covers half M1 + half M2, next invoice HALF fee due on 15th, then 1st M3 onwards full.
-//    - Custom (3,5,6,7…): perSessionRate = monthlyFee / totalMonthlySessions, M1 cost = remaining*perSessionRate, excess credited to M2 (ratio = remaining/total).
-// 5. Reste guard: dueDate <= today only, future auto-generated sessions excluded.
+// 1. Session-Based Pricing (Rule A):
+//      fixedCount   = 4 × scheduledDaysOfWeek.length   (1x/week → 4, 2x/week → 8)
+//      perSession   = monthlyFee ÷ fixedCount
+//      month amount = perSession × sessions the student will attend that month
+//    A month with a 5th occurrence bills it FREE (billable capped at fixedCount).
+//    monthlyFee is pulled dynamically via PriceEntry/customPrice.
+// 2. Standard vs Extra: ONLY standard/fixed sessions (kind !== "one_off")
+//    count. Extra "حصة إضافية" (one_off) is 100% free, excluded from the count.
+// 3. Attendance vs Billing: a scheduled standard class = CONSUMED SESSION
+//    even if absent. Attendance is tracking only.
+// 4. Join month: only sessions from enrolledAt → month-end count. When the
+//    student joins with ≤1 billable session left, that single session is
+//    FREE (no installment emitted for the join month).
+// 5. Months before enrollment / months with zero scheduled occurrences (gap
+//    months) / combos with no timetable: NO installment ("–").
+// 6. Reste guard: dueDate <= today only, future auto-generated sessions excluded.
 
 import { getSessionKind } from "@/lib/ennajd-taxonomy";
 import type { EnrollmentCombo } from "@/lib/ennajd-taxonomy";
@@ -38,18 +43,18 @@ export type PaymentRule = "A" | "B";
 /** Subjects that carry the rolling Rule B cycle for 2Bac s.x Small — unified per the old small-group app screenshots. */
 const SMALL_GROUP_RULE_B_SUBJECTS: Subject[] = ["Math", "PC", "SVT"];
 
-export interface ScheduledInstallment {
-  dueDate: Date;
-  isHalfMonth: boolean;
-  amountRatio: number; // fraction of the full monthly price this installment is worth
-  autoPaid: boolean; // whether this installment should be created already marked paid
+/** One generated installment with an ABSOLUTE amount (MAD). */
+export interface SessionInstallment {
+  monthKey: string; // "YYYY-MM"
+  dueDate: string; // "YYYY-MM-DD"
+  amount: number; // MAD, absolute
 }
 
 /**
  * Rule B (rolling, no calendar alignment) — unified for ALL 2Bac s.x
  * Small groups (Math/PC/SVT) per the old small-group app screenshots.
  * PROCHAINE ÉCHÉANCE = DATE DE LA PREMIÈRE SÉANCE + n mois.
- * Every other combo remains on Rule A.
+ * Every other combo remains on Rule A (session-based pricing).
  */
 export function getPaymentRuleFor(
   level: Level,
@@ -62,15 +67,6 @@ export function getPaymentRuleFor(
   if (track !== undefined && track !== null && track !== "s.x") return "A";
   return "B";
 }
-
-/**
- * If a student had at most this many STANDARD sessions between their join
- * date and the end of their join month, month 1 was effectively a bonus.
- */
-const FREE_BONUS_MAX_SESSIONS = 2;
-
-/** The day-of-month treated as "the middle of the month" for Rule A. */
-const MID_MONTH_HALF_DAY = 15;
 
 function daysInMonth(year: number, monthIndex0: number): number {
   return new Date(year, monthIndex0 + 1, 0).getDate();
@@ -107,20 +103,18 @@ function isStandardSession(s: Session): boolean {
  * Which STANDARD scheduled days a given Level/Subject/Track/GroupType combo has.
  * Attendance records are IGNORED for billing (Rule 3) — a scheduled class counts as
  * CONSUMED SESSION regardless of individual absence. Extra sessions are excluded 100% (Rule 2).
- * When no standard Session exists yet for the combo, `hasSession` is false and callers
- * should fall back to the theoretical weekly cadence (once a week, on `fallbackDayOfWeek`),
- * still counting only standard frequency (dynamic via 4 or 8 per month depending on schedule).
+ * When no standard Session exists for the combo, `hasSession` is false and
+ * `scheduledDaysOfWeek` is empty → the session-based engine emits NO installment
+ * (a subject with no timetable is not billable).
  */
 export interface DeliveredDatesContext {
   hasSession: boolean;
   scheduledDaysOfWeek: number[]; // unique dayOfWeek values for standard sessions of this combo
-  fallbackDayOfWeek: number; // enrolledAt's day-of-week; only used when hasSession is false
+  fallbackDayOfWeek: number; // enrolledAt's day-of-week; unused by the session-based engine
   /** "YYYY-MM" months where this combo has ZERO standard scheduled occurrences
-   *  (Rule D — gap months). A recurring weekly slot lands on every weekday of
-   *  every calendar month, so this set is empty for a normal timetable; it is
-   *  populated for combos that were only ever scheduled via dated (one_off)
-   *  sessions, and callers/tests may mark extra gap months (term breaks,
-   *  timetable added mid-year). No installment is emitted for a gap month. */
+   *  (gap months). A recurring weekly slot lands on every weekday of every
+   *  calendar month, so this set is empty for a normal timetable. No installment
+   *  is emitted for a gap month. */
   gapMonthKeys: ReadonlySet<string>;
 }
 
@@ -128,7 +122,7 @@ export function buildDeliveredDatesContext(
   sessions: Session[],
   _attendanceRecords: AttendanceRecord[], // kept for signature compat — IGNORED for billing (Rule 3)
   combo: EnrollmentCombo,
-  enrolledAt: Date,
+  _enrolledAt: Date,
 ): DeliveredDatesContext {
   const matchingStandard = sessions.filter(
     (s) =>
@@ -142,8 +136,8 @@ export function buildDeliveredDatesContext(
   return {
     hasSession: matchingStandard.length > 0,
     scheduledDaysOfWeek: [...new Set(matchingStandard.map((s) => s.dayOfWeek))],
-    fallbackDayOfWeek: enrolledAt.getDay(),
-    // Rule D — gap months: months where the combo has zero STANDARD
+    fallbackDayOfWeek: 0,
+    // Rule 5 — gap months: months where the combo has zero STANDARD
     // scheduled occurrences. A recurring weekly slot covers every calendar
     // month, so only dated (one_off) standard sessions can produce real
     // gaps here; the set stays empty for a normal recurring timetable.
@@ -156,15 +150,14 @@ export function buildDeliveredDatesContext(
 }
 
 /**
- * Counts STANDARD scheduled occurrences within an inclusive date range,
- * dynamically per subject/level schedule (1x/week≈4/mois, 2x/week≈8/mois).
+ * Counts STANDARD scheduled occurrences within an inclusive date range.
  * Extra sessions never counted (Rule 2). Attendance never consulted (Rule 3).
  */
 function countOccurrencesInRange(ctx: DeliveredDatesContext, from: Date, to: Date): number {
   const start = normalizeDateOnly(from);
   const end = normalizeDateOnly(to);
   if (start > end) return 0;
-  const days = ctx.hasSession ? ctx.scheduledDaysOfWeek : [ctx.fallbackDayOfWeek];
+  const days = ctx.scheduledDaysOfWeek;
   if (days.length === 0) return 0;
   let count = 0;
   const cursor = new Date(start);
@@ -176,179 +169,162 @@ function countOccurrencesInRange(ctx: DeliveredDatesContext, from: Date, to: Dat
 }
 
 /**
- * Rule D — gap month: the combo has ZERO standard scheduled occurrences in
- * the calendar month containing `date`. Deterministic (purely schedule-based;
- * attendance is never consulted, consistent with Rule 3) and can't be gamed:
- * with a recurring weekly timetable every month has ≥1 occurrence, so a gap
- * only arises when the combo isn't scheduled that month at all (timetable
- * added mid-year, term breaks, combo not yet scheduled, or an explicit
- * `gapMonthKeys` entry). A gap month emits NO installment → no debt accumulates
- * and the Payments/Reports UI renders "-".
+ * The fixed number of billable sessions per month for a combo:
+ * 4 × (scheduled days per week). 1 day/week → 4, 2 days/week → 8.
+ * Zero when the combo has no timetable → not billable.
  */
-function isGapMonth(ctx: DeliveredDatesContext, date: Date): boolean {
-  const year = date.getFullYear();
-  const monthIndex0 = date.getMonth();
-  const monthStart = new Date(year, monthIndex0, 1);
-  const monthEnd = new Date(year, monthIndex0, daysInMonth(year, monthIndex0));
-  if (countOccurrencesInRange(ctx, monthStart, monthEnd) === 0) return true;
-  return ctx.gapMonthKeys.has(formatMonthKey(date));
+export function getFixedSessionCount(ctx: DeliveredDatesContext): number {
+  return 4 * ctx.scheduledDaysOfWeek.length;
 }
 
 /**
- * Rule A schedule (every combo except 2Bac PC-Small):
- * Dynamic per subject/level — totalMonthlySessions and monthlyFee are not hardcoded.
- * Extra sessions excluded 100%. Attendance does not affect billing.
+ * How many sessions a student who enrolled at `enrolledAt` will be billed
+ * for in the calendar month containing `monthDate` — the count of STANDARD
+ * scheduled occurrences in the billable window, capped at `fixedCount` (the
+ * 5th occurrence in a month is free).
  *
- * - Month 1 charges the full fee upfront, due on the join date itself (Rule D:
- *   skipped entirely when the combo has zero standard scheduled occurrences in
- *   the join month — no sessions, no charge, no debt).
- * - Month 2 (next calendar month) is tiered based on STANDARD sessions remaining in join month:
- *   - Exactly half (e.g. 2/4 or 4/8) → half-month: HALF fee due on the 15th of next month to align cycle to 1st of M3.
- *     Checked FIRST so 2/4 is half, not late-bonus.
- *   - ≤2 remaining (and not exactly half) → late-join FREE bonus: those sessions free, upfront credited to next month (autoPaid on 1st).
- *   - Otherwise (3,5,6,7…) → custom prorated: perSessionRate = monthlyFee / totalMonthlySessions,
- *     M1 cost = remaining * perSessionRate, excess credited → M2 ratio = remaining/total on 1st.
- * - Every month from the month after the tier adjustment onward is plain full-price on the 1st.
- * - Rule D (gap months): any month with ZERO standard scheduled occurrences of
- *   the combo emits NO installment at all (term breaks, timetable added
- *   mid-year, combo not yet scheduled) — no debt accumulates and the UI
- *   renders "-".
+ * Returns `null` when NO installment should be emitted for that month:
+ *  - the combo has no timetable (fixedCount === 0),
+ *  - the month is entirely before the enrollment month,
+ *  - the month has zero scheduled occurrences (gap month),
+ *  - the join month has ≤1 billable session left (single session = free).
  */
-export function generateRuleASchedule(
+function computeMonthBillable(
   enrolledAt: Date,
-  asOf: Date,
+  monthDate: Date,
   ctx: DeliveredDatesContext,
-): ScheduledInstallment[] {
-  if (enrolledAt > asOf) return [];
+): number | null {
+  const fixedCount = getFixedSessionCount(ctx);
+  if (fixedCount === 0) return null;
 
-  const monthStart = startOfMonth(enrolledAt);
+  const monthStart = startOfMonth(monthDate);
   const monthEnd = new Date(
     monthStart.getFullYear(),
     monthStart.getMonth(),
     daysInMonth(monthStart.getFullYear(), monthStart.getMonth()),
   );
-  const nextMonthDue = addMonthsClamped(monthStart, 1); // 1st of next month
 
-  const remaining = countOccurrencesInRange(ctx, enrolledAt, monthEnd);
-  const total = countOccurrencesInRange(ctx, monthStart, monthEnd);
+  // Months entirely before enrollment are never billed.
+  if (monthEnd < normalizeDateOnly(enrolledAt)) return null;
 
-  // Rule A — Single Session Skip Exception: exactly 1 remaining session
-  // → DO NOT charge current month (leave EMPTY/BLANK — display as '-').
-  // Apply 100% of tuition to next month's installment (autoPaid: true).
-  if (remaining === 1) {
-    if (nextMonthDue > asOf) return [];
-    const results: ScheduledInstallment[] = [];
-    // Rule D: skip months with zero standard scheduled occurrences.
-    if (!isGapMonth(ctx, nextMonthDue)) {
+  // Explicit gap month (term break / timetable added mid-year) → no installment.
+  if (ctx.gapMonthKeys.has(formatMonthKey(monthDate))) return null;
+
+  const isJoinMonth =
+    monthDate.getFullYear() === enrolledAt.getFullYear() &&
+    monthDate.getMonth() === enrolledAt.getMonth();
+
+  const count = isJoinMonth
+    ? countOccurrencesInRange(ctx, enrolledAt, monthEnd)
+    : countOccurrencesInRange(ctx, monthStart, monthEnd);
+
+  // A month with zero scheduled occurrences is a gap month too.
+  if (count === 0) return null;
+
+  const billable = Math.min(count, fixedCount);
+
+  // Join month with a single remaining session → that session is free.
+  if (isJoinMonth && billable <= 1) return null;
+
+  return billable;
+}
+
+/**
+ * Expected installment amount (MAD) for one calendar month, using the
+ * session-based formula: perSession × billable sessions. Returns `null`
+ * when no installment should exist for that month (see computeMonthBillable).
+ *
+ * `price` is the monthly fee for this student+subject (already resolved with
+ * customPrice by the caller). Pure — used both by the generator and by
+ * `buildPaymentMatrix` / `reconcilePaymentAmounts` to detect stale or
+ * discounted rows.
+ */
+export function computeExpectedMonthAmount(
+  enrolledAt: Date,
+  monthKey: string, // "YYYY-MM"
+  ctx: DeliveredDatesContext,
+  price: number,
+): number | null {
+  const [yearStr, monthStr] = monthKey.split("-");
+  const year = Number(yearStr);
+  const monthIndex0 = Number(monthStr) - 1;
+  if (!Number.isFinite(year) || !Number.isFinite(monthIndex0)) return null;
+
+  const billable = computeMonthBillable(enrolledAt, new Date(year, monthIndex0, 1), ctx);
+  if (billable === null) return null;
+
+  const fixedCount = getFixedSessionCount(ctx);
+  return Math.round((price / fixedCount) * billable);
+}
+
+/**
+ * Rule A schedule — session-based pricing. For every month from the join
+ * month through `asOf`, emits one installment whose amount is
+ * perSession × (sessions the student will attend that month):
+ *
+ *  - join month: occurrences in [enrolledAt, month-end],
+ *  - other months: occurrences in the full month,
+ *  - billable capped at fixedCount (a 5th weekly occurrence is free),
+ *  - join month with ≤1 session left → free (no installment),
+ *  - gap months / pre-enrollment months / no timetable → no installment.
+ *
+ * Due date: `enrolledAt` itself for the join month, the 1st of the month
+ * for every later month.
+ */
+export function generateSessionBasedSchedule(
+  enrolledAt: Date,
+  asOf: Date,
+  ctx: DeliveredDatesContext,
+  price: number,
+): SessionInstallment[] {
+  if (!ctx.hasSession || ctx.scheduledDaysOfWeek.length === 0) return [];
+  if (enrolledAt > asOf) return [];
+
+  const fixedCount = getFixedSessionCount(ctx);
+  const perSession = price / fixedCount;
+
+  const results: SessionInstallment[] = [];
+  const asOfMonth = startOfMonth(asOf);
+  let cursor = startOfMonth(enrolledAt);
+  while (cursor <= asOfMonth) {
+    const billable = computeMonthBillable(enrolledAt, cursor, ctx);
+    if (billable !== null) {
+      const isJoinMonth =
+        cursor.getFullYear() === enrolledAt.getFullYear() &&
+        cursor.getMonth() === enrolledAt.getMonth();
+      const dueDate = isJoinMonth ? enrolledAt : cursor;
       results.push({
-        dueDate: nextMonthDue,
-        isHalfMonth: false,
-        amountRatio: 1,
-        autoPaid: true,
+        monthKey: formatMonthKey(cursor),
+        dueDate: formatDateKey(dueDate),
+        amount: Math.round(perSession * billable),
       });
     }
-    let next = addMonthsClamped(nextMonthDue, 1);
-    while (next <= asOf) {
-      if (!isGapMonth(ctx, next)) {
-        results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
-      }
-      next = addMonthsClamped(next, 1);
-    }
-    return results;
-  }
-
-  // Default: Month 1 full fee upfront on the join date.
-  // Rule D: emit nothing for the join month when the combo has zero standard
-  // scheduled occurrences in it (no sessions → no charge).
-  const results: ScheduledInstallment[] = [];
-  if (!isGapMonth(ctx, enrolledAt)) {
-    results.push({ dueDate: enrolledAt, isHalfMonth: false, amountRatio: 1, autoPaid: false });
-  }
-
-  if (nextMonthDue > asOf) return results;
-
-  // Dynamic half check: exactly half of standard monthly sessions (2/4, 4/8, 3/6, etc.)
-  const isExactlyHalf = total > 0 && remaining * 2 === total;
-
-  // Tier 2 — Half-Month Join (exactly half) takes precedence over Late when overlapping (e.g. 2/4)
-  if (isExactlyHalf) {
-    const midNextMonth = new Date(nextMonthDue.getFullYear(), nextMonthDue.getMonth(), MID_MONTH_HALF_DAY);
-    if (midNextMonth <= asOf && !isGapMonth(ctx, midNextMonth)) {
-      results.push({
-        dueDate: midNextMonth, // 15th to align cycle to 1st of M3
-        isHalfMonth: true,
-        amountRatio: 0.5, // dynamically monthlyFee/2 at sync time
-        autoPaid: false,
-      });
-    }
-    // From M3 (monthStart+2) onwards, billing shifts permanently to 1st of every month at FULL fee
-    let next = addMonthsClamped(monthStart, 2);
-    while (next <= asOf) {
-      if (!isGapMonth(ctx, next)) {
-        results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
-      }
-      next = addMonthsClamped(next, 1);
-    }
-    return results;
-  }
-
-  // Tier 1 — Late-Month Join (<=2 standard sessions remaining) → FREE bonus
-  if (remaining <= FREE_BONUS_MAX_SESSIONS) {
-    if (!isGapMonth(ctx, nextMonthDue)) {
-      results.push({
-        dueDate: nextMonthDue,
-        isHalfMonth: false,
-        amountRatio: 1,
-        autoPaid: true, // upfront full fee credited 100% toward next month's invoice; the <=2 sessions are FREE
-      });
-    }
-    let next = addMonthsClamped(nextMonthDue, 1);
-    while (next <= asOf) {
-      if (!isGapMonth(ctx, next)) {
-        results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
-      }
-      next = addMonthsClamped(next, 1);
-    }
-    return results;
-  }
-
-  // Tier 3 — Custom Session Join (3,5,6,7…)
-  // perSessionRate = monthlyFee / totalMonthlySessions (dynamic)
-  // join month cost = sessionsRemaining * perSessionRate
-  // excess upfront credited toward next month => M2 ratio = remaining/total
-  const ratio = total > 0 ? remaining / total : 1;
-  if (!isGapMonth(ctx, nextMonthDue)) {
-    results.push({
-      dueDate: nextMonthDue,
-      isHalfMonth: false,
-      amountRatio: ratio,
-      autoPaid: false,
-    });
-  }
-
-  let next = addMonthsClamped(nextMonthDue, 1);
-  while (next <= asOf) {
-    if (!isGapMonth(ctx, next)) {
-      results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
-    }
-    next = addMonthsClamped(next, 1);
+    cursor = addMonthsClamped(cursor, 1);
   }
   return results;
 }
 
 /**
- * Rule B schedule (2Bac PC-Small only): no calendar alignment at all —
- * a full-price charge on the join date, then every month on that same
- * day-of-month, forever.
+ * Rule B schedule (2Bac s.x Small Math/PC/SVT only): no calendar alignment
+ * at all — a full-price charge on the join date, then every month on that
+ * same day-of-month, forever.
  */
-export function generateRuleBSchedule(enrolledAt: Date, asOf: Date): ScheduledInstallment[] {
+export function generateRuleBSchedule(
+  enrolledAt: Date,
+  asOf: Date,
+  price: number,
+): SessionInstallment[] {
   if (enrolledAt > asOf) return [];
 
-  const results: ScheduledInstallment[] = [];
+  const results: SessionInstallment[] = [];
   let i = 0;
   let cursor = enrolledAt;
   while (cursor <= asOf) {
-    results.push({ dueDate: cursor, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+    results.push({
+      monthKey: formatMonthKey(cursor),
+      dueDate: formatDateKey(cursor),
+      amount: Math.round(price),
+    });
     i += 1;
     cursor = addMonthsClamped(enrolledAt, i);
   }
@@ -360,10 +336,11 @@ export function generateScheduleFor(
   enrolledAt: Date,
   asOf: Date,
   ctx: DeliveredDatesContext,
-): ScheduledInstallment[] {
+  price: number,
+): SessionInstallment[] {
   return rule === "B"
-    ? generateRuleBSchedule(enrolledAt, asOf)
-    : generateRuleASchedule(enrolledAt, asOf, ctx);
+    ? generateRuleBSchedule(enrolledAt, asOf, price)
+    : generateSessionBasedSchedule(enrolledAt, asOf, ctx, price);
 }
 
 /** "YYYY-MM-DD" using local calendar fields (not UTC — avoids TZ day-shift bugs). */
@@ -381,9 +358,98 @@ export function formatMonthKey(date: Date): string {
   return `${y}-${m}`;
 }
 
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
+// Ledger reconciliation — self-heal stale Rule A amounts after a price or
+// timetable change. Rule B rows and customPrice rows are never touched.
+// ---------------------------------------------------------------------------//
+
+export interface ReconcilePatch {
+  id: string;
+  amountDue: number;
+  /** Recomputed isPaid: true only when amountPaid covers the NEW amountDue. */
+  isPaid: boolean;
+}
+
+/**
+ * Recomputes the expected `amountDue` of every Rule A installment and
+ * reports the ones that drifted (price change, timetable edit, engine
+ * migration). `isPaid` is recomputed strictly from `amountPaid` — a row
+ * stays paid only when the paid amount covers the new expected amount.
+ * Rule B rows and rows whose expected amount is null (no timetable / gap
+ * month) are left untouched. Pure — the store layer applies the patches.
+ */
+export function reconcilePaymentAmounts(
+  payments: Payment[],
+  students: Student[],
+  sessions: Session[],
+  prices: PriceEntry[],
+): ReconcilePatch[] {
+  const studentsById = new Map(students.map((s) => [s.id, s]));
+  const patches: ReconcilePatch[] = [];
+
+  for (const payment of payments) {
+    if (payment.rule !== "A") continue;
+    const student = studentsById.get(payment.studentId);
+    if (!student) continue;
+    const enrollment = student.enrollments.find((e) => e.subject === payment.subject);
+    if (!enrollment) continue;
+
+    const price = getEffectivePriceFor(
+      student,
+      enrollment,
+      prices,
+    );
+    if (price === undefined) continue;
+
+    const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+    const ctx = buildDeliveredDatesContext(
+      sessions,
+      [],
+      {
+        level: student.level,
+        subject: enrollment.subject,
+        track: enrollment.track,
+        groupType: enrollment.groupType,
+      },
+      enrolledAt,
+    );
+
+    const expected = computeExpectedMonthAmount(enrolledAt, payment.month, ctx, price);
+    if (expected === null || expected === payment.amountDue) continue;
+
+    patches.push({
+      id: payment.id,
+      amountDue: expected,
+      isPaid: (payment.amountPaid ?? 0) >= expected,
+    });
+  }
+
+  return patches;
+}
+
+/**
+ * Resolves the monthly fee for one enrollment: `customPrice` wins over the
+ * base PriceEntry (Takhfid). Returns undefined when no price is defined at
+ * all (not billable).
+ */
+export function getEffectivePriceFor(
+  student: Student,
+  enrollment: SubjectEnrollment,
+  prices: PriceEntry[],
+): number | undefined {
+  if (enrollment.customPrice !== undefined) return enrollment.customPrice;
+  return prices.find(
+    (p) =>
+      p.level === student.level &&
+      p.subject === enrollment.subject &&
+      p.track === enrollment.track &&
+      p.groupType === enrollment.groupType,
+  )?.price;
+}
+
+// ---------------------------------------------------------------------------//
 // Partial-payment helpers
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 
 export function getPaymentRemaining(payment: Payment): number {
   const paid = payment.amountPaid ?? 0;
@@ -399,191 +465,9 @@ export function isPaymentFullyPaid(payment: Payment): boolean {
   return payment.isPaid || (payment.amountPaid ?? 0) >= payment.amountDue;
 }
 
-// ---------------------------------------------------------------------------
-// Advance-credit waterfall (cross-month surplus distribution)
-// ---------------------------------------------------------------------------
-
-/** Context passed by the store layer so the waterfall can apply attendance-
- * sheet proration Rules A-D. When omitted, applyCreditWaterfall falls back
- * to plain gap-filling (backward compatible). */
-export interface WaterfallContext {
-  student: Student;
-  sessions: Session[];
-  prices: PriceEntry[];
-}
-
-/** Null/undefined normalizer for track/groupType comparison — mirrors the
- * helper in ennajd-taxonomy.ts but kept local to avoid a cross-module import
- * in the pure billing layer. */
-export function normalizeNull<T extends string | null | undefined>(
-  value: T,
-): string | null {
-  return (value ?? null) as string | null;
-}
-
-/**
- * Whether a subject carries session-based proration Rules A-D.
- * 2BAC Small Groups (P.G 2BAC — 2Bac s.x Small on Math/PC/SVT) are EXEMPT:
- * `getPaymentRuleFor` returns "B" (rolling join-date cycle) for them, so
- * there is no calendar-aligned "current month" to prorate against — the
- * waterfall falls back to plain gap-filling.
- */
-export function isProratedSubject(student: Student, subject: Subject): boolean {
-  // Find the relevant enrollment for this subject.
-  for (const enrollment of student.enrollments) {
-    if (enrollment.subject !== subject) continue;
-    // Rule B combos are exempt (2Bac s.x Small on Math/PC/SVT).
-    if (getPaymentRuleFor(student.level, subject, enrollment.groupType, enrollment.track) === "B") {
-      return false;
-    }
-    return true;
-  }
-  // No enrollment found — treat as non-prorated (no-op).
-  return false;
-}
-
-/**
- * Counts the STANDARD (non-one_off) sessions remaining in the current month
- * for a given student+subject, from `from` (enrolledAt) through month-end.
- * Uses the same combo-matching logic as `buildDeliveredDatesContext`.
- *
- * Returns `null` when no standard sessions exist for the combo
- * (hasSession=false) — callers must fall back to plain gap-fill in that case.
- */
-export function computeRemainingSessionsInMonth(
-  student: Student,
-  subject: Subject,
-  sessions: Session[],
-  from: Date,
-  asOfKey: string,
-): number | null {
-  // Find the enrollment's track/groupType for this subject.
-  const enrollment = student.enrollments.find((e) => e.subject === subject);
-  if (!enrollment) return null;
-
-  const monthEnd = new Date(
-    from.getFullYear(),
-    from.getMonth(),
-    daysInMonth(from.getFullYear(), from.getMonth()),
-  );
-
-  // Count standard sessions matching this combo whose date falls within
-  // [from, monthEnd] for recurring sessions, or whose date key falls in
-  // the same calendar month for one-off sessions.
-  let remaining = 0;
-  for (const session of sessions) {
-    if (!isStandardSession(session)) continue;
-    if (session.subject !== subject) continue;
-    if (session.level !== student.level) continue;
-    if (normalizeNull(session.track) !== normalizeNull(enrollment.track)) continue;
-    if (normalizeNull(session.groupType) !== normalizeNull(enrollment.groupType)) continue;
-
-    // Recurring sessions: count occurrences of dayOfWeek in [from, monthEnd].
-    // (In this simplified model, each recurring session represents a weekly
-    // slot. We count one occurrence per matching day-of-week in range.)
-    if (getSessionKind(session) === "recurring") {
-      const cursor = new Date(from);
-      while (cursor <= monthEnd) {
-        if (cursor.getDay() === session.dayOfWeek) remaining++;
-        cursor.setDate(cursor.getDate() + 1);
-      }
-    }
-  }
-
-  if (remaining === 0) return null;
-  return remaining;
-}
-
-/** Per-subject proration profile used by the credit waterfall Rules A-D. */
-export interface SubjectProration {
-  /** Fraction of credit that belongs on the current month (remaining/total).
-   *  Rule C (full month) = 1.0; Rule B (partial) < 1.0; Rule A skip = 0. */
-  ratio: number;
-  /** Rule A (Single Session Skip): only 1 standard session remains in the
-   *  join month -> skip current-month installments entirely, direct
-   *  100% to future months. Scoped to the join month only via
-   *  `joinMonthKey` — later months are always creditable. */
-  skipCurrent: boolean;
-  /** "YYYY-MM" of the student's enrollment join date for this subject.
-   *  `skipCurrent` only applies to installments whose dueDate falls in this
-   *  calendar month; every other month owes its full installment. */
-  joinMonthKey: string;
-}
-
-/**
- * Pre-computes the attendance-sheet proration (Rules A/B/C/D) for a single
- * subject. Returns null when the subject is exempt (Rule B cycle, i.e.
- * 2Bac s.x Small) or no standard session data is available, so the caller
- * falls back to plain gap-filling.
- *
- * Extracted from applyCreditWaterfall so the same logic runs once per
- * subject (instead of once per call), enabling cross-subject mode.
- */
-function computeSubjectProration(
-  student: Student,
-  subject: Subject,
-  sessions: Session[],
-  from: Date,
-  asOfKey: string,
-): SubjectProration | null {
-  // Rule B combos (2Bac s.x Small on Math/PC/SVT) are exempt — rolling cycle.
-  if (!isProratedSubject(student, subject)) return null;
-
-  const enrollment = student.enrollments.find((e) => e.subject === subject);
-  if (!enrollment) return null;
-
-  const remainingSessions = computeRemainingSessionsInMonth(
-    student,
-    subject,
-    sessions,
-    from,
-    asOfKey,
-  );
-
-  if (remainingSessions === null) return null;
-
-  // joinMonthKey = the calendar month the student enrolled in this subject.
-  // Rule A's skipCurrent only applies to installments in THIS month.
-  const joinMonthKey = formatMonthKey(from);
-
-  // --- Rule A: Single Session Skip ---
-  // Only 1 standard session remains in the join month -> skip current-month
-  // installments entirely, direct 100% to future months.
-  if (remainingSessions === 1) {
-    return { ratio: 0, skipCurrent: true, joinMonthKey };
-  }
-
-  // --- Rules B (Partial) & C (Full Month) ---
-  // Compute total standard sessions in the current month to derive the
-  // proration ratio: remaining / total.
-  const monthStart = startOfMonth(from);
-  const monthEnd = new Date(
-    monthStart.getFullYear(),
-    monthStart.getMonth(),
-    daysInMonth(monthStart.getFullYear(), monthStart.getMonth()),
-  );
-  let total = 0;
-  for (const session of sessions) {
-    if (!isStandardSession(session)) continue;
-    if (session.subject !== subject) continue;
-    if (session.level !== student.level) continue;
-    if (normalizeNull(session.track) !== normalizeNull(enrollment.track)) continue;
-    if (normalizeNull(session.groupType) !== normalizeNull(enrollment.groupType)) continue;
-
-    if (getSessionKind(session) === "recurring") {
-      const cursor = new Date(monthStart);
-      while (cursor <= monthEnd) {
-        if (cursor.getDay() === session.dayOfWeek) total++;
-        cursor.setDate(cursor.getDate() + 1);
-      }
-    }
-  }
-
-  const ratio = total > 0 ? remainingSessions / total : 1;
-  // Rule C: remaining == total -> ratio = 1.0 -> 100% current month.
-  // Rule B: remaining < total -> ratio < 1.0 -> prorated.
-  return { ratio, skipCurrent: false, joinMonthKey };
-}
+// ---------------------------------------------------------------------------//
+// Advance-credit waterfall (simple dueDate-ascending gap filling)
+// ---------------------------------------------------------------------------//
 
 export interface CreditWaterfallResult {
   /** New payment objects reflecting the credit applied (only installment rows that changed).
@@ -594,36 +478,15 @@ export interface CreditWaterfallResult {
   remaining: number;
   /** True when at least one installment was fully or partially changed. */
   anyChanged: boolean;
-  /** Total credit applied to the current month's installment(s) (dueDate <= asOfKey).
-   *  Populated only when `context` is provided; 0 otherwise. */
-  currentMonthCredit: number;
-  /** Total credit applied to future-month installment(s) (dueDate > asOfKey).
-   *  Populated only when `context` is provided; 0 otherwise. */
-  futureMonthCredit: number;
 }
 
 /**
  * Distributes `credit` (MAD) across installments in `dueDate`-ascending
  * order, applying to each installment's remaining gap (`amountDue - amountPaid`).
  *
- * When `context` is provided AND the subject is proration-eligible
- * (`isProratedSubject` returns true), the attendance-sheet proration
- * Rules A-D are applied:
- *
- * - **Rule A (Single Session Skip)**: only 1 standard session remains in the
- *   current month → skip crediting current-month installments entirely,
- *   direct 100% to future installments.
- * - **Rule B (Partial Attendance)**: 2+ standard sessions remain → credit a
- *   prorated proportion (remaining / total) to the current month; surplus
- *   carries forward to future months as advance credit.
- * - **Rule C (Full Month)**: all sessions remain (joined at start of month)
- *   → remaining == total → ratio = 1.0 → 100% to current month.
- * - **Rule D (Gap Months)**: no installments exist for gap months (handled by
- *   `generateRuleASchedule`) → the waterfall has no rows to credit, leaving
- *   them as `-` automatically.
- *
- * When `context` is omitted OR the subject is exempt (2BAC Small Groups /
- * Rule B cycle), falls back to plain gap-filling (backward compatible).
+ * With the session-based engine the installment amounts are already exact,
+ * so plain gap-filling is all that's needed: no proration tiers, no
+ * current/future month split.
  *
  * - `subject === null` means cross-subject (any subject for that student) —
  *   used by the creation-time `applyInitialTuitionPayment` waterfall.
@@ -633,8 +496,6 @@ export interface CreditWaterfallResult {
  *   `advanceBalance`.
  * - Returns a minimal `updated` array (changed rows only) so callers can
  *   merge by `id` without rewriting the whole ledger.
- * - `currentMonthCredit` and `futureMonthCredit` break down how much credit
- *   landed on due vs. future installments (0 when no context).
  *
  * Pure — no React/Zustand, no hidden date().
  */
@@ -643,16 +504,13 @@ export function applyCreditWaterfall(
   studentId: string,
   subject: Subject | null,
   credit: number,
-  asOfKey: string,
+  _asOfKey: string,
   updatedAt: string,
-  context?: WaterfallContext,
 ): CreditWaterfallResult {
   const emptyResult: CreditWaterfallResult = {
     updated: [],
     remaining: Math.max(0, Math.round(credit)),
     anyChanged: false,
-    currentMonthCredit: 0,
-    futureMonthCredit: 0,
   };
 
   if (!Number.isFinite(credit) || credit <= 0) {
@@ -670,140 +528,30 @@ export function applyCreditWaterfall(
   );
   eligible.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 
-  // --- Proration Rules A-D (per-subject, pre-computed in a Map) ---
-  // In per-subject mode (subject !== null) only that subject is prorated.
-  // In cross-subject mode (subject === null) every proration-eligible
-  // enrollment is pre-computed so each payment looks up its own subject
-  // during the loop — this is what fixes the cross-subject bug where a single
-  // global flag previously blocked Rules A-D entirely during creation-time
-  // distribution (applyInitialTuitionPayment passes subject=null).
-  let subjectProration: Map<Subject, SubjectProration> | undefined;
-  if (context) {
-    subjectProration = new Map();
-    for (const enrollment of context.student.enrollments) {
-      // Per-subject mode: only compute for the requested subject.
-      if (subject !== null && enrollment.subject !== subject) continue;
-      const enrolledAt = new Date(
-        enrollment.enrolledAt ?? context.student.createdAt,
-      );
-      const from =
-        enrolledAt <= new Date(asOfKey) ? enrolledAt : new Date(asOfKey);
-      const proration = computeSubjectProration(
-        context.student,
-        enrollment.subject,
-        context.sessions,
-        from,
-        asOfKey,
-      );
-      if (proration) subjectProration.set(enrollment.subject, proration);
-    }
-  }
-
   const updated: Payment[] = [];
   let remaining = Math.max(0, Math.round(credit));
-  let currentMonthCredit = 0;
-  let futureMonthCredit = 0;
-
-  // Per-subject current-month budget (Rule B/C): the total credit earmarked
-  // for this subject's current-month installments, computed ONCE as
-  // Math.round(credit * ratio). Tracked via budgetSpent so repeated
-  // Math.round per row never overshoots — unspent budget stays in `remaining`
-  // and naturally flows to the next due installment / advanceBalance.
-  const budgetBySubject = new Map<Subject, number>();
-  const budgetSpentBySubject = new Map<Subject, number>();
-  if (subjectProration) {
-    for (const [subj, proration] of subjectProration) {
-      if (proration.ratio > 0) {
-        budgetBySubject.set(subj, Math.round(credit * proration.ratio));
-        budgetSpentBySubject.set(subj, 0);
-      }
-    }
-  }
 
   for (const payment of eligible) {
     if (remaining <= 0) break;
-
-    const isCurrentMonth = payment.dueDate <= asOfKey;
-
-    // Look up this payment's own subject proration profile (Rules A-D).
-    const proration = subjectProration?.get(payment.subject);
-
-    // Rule A skip: only for installments in the JOIN month (scoped fix).
-    // Later months always remain creditable.
-    if (
-      proration?.skipCurrent &&
-      isCurrentMonth &&
-      payment.dueDate.slice(0, 7) === proration.joinMonthKey
-    ) {
-      continue;
-    }
 
     const currentPaid = payment.amountPaid ?? 0;
     const gap = Math.max(0, payment.amountDue - currentPaid);
     if (gap <= 0) continue;
 
-    let apply: number;
-
-    if (proration && isCurrentMonth && proration.ratio > 0) {
-      // Rule B / C: apply prorated proportion of credit to current month,
-      // bounded by the once-per-subject budget (not a fresh credit*ratio
-      // per row, which could overshoot). Unspent budget stays in
-      // `remaining` and flows to the next installment.
-      const spent = budgetSpentBySubject.get(payment.subject) ?? 0;
-      const budget = budgetBySubject.get(payment.subject) ?? 0;
-      apply = Math.min(gap, budget - spent, remaining);
-      budgetSpentBySubject.set(payment.subject, spent + apply);
-    } else {
-      apply = Math.min(gap, remaining);
-    }
-
+    const apply = Math.min(gap, remaining);
     if (apply <= 0) continue;
 
     const amountPaid = currentPaid + apply;
     const isPaid = amountPaid >= payment.amountDue;
     updated.push({ ...payment, amountPaid, isPaid, updatedAt });
     remaining -= apply;
-
-    if (isCurrentMonth) {
-      currentMonthCredit += apply;
-    } else {
-      futureMonthCredit += apply;
-    }
   }
 
   return {
     updated,
     remaining: Math.max(0, remaining),
     anyChanged: updated.length > 0,
-    currentMonthCredit,
-    futureMonthCredit,
   };
-}
-
-/**
- * Computes the prorated cost for the current month — the sum of remaining
- * gaps on unpaid installments whose dueDate <= asOfKey (the app-wide "due"
- * definition). Used by the dialog to show how much the current month actually
- * owes before showing the carry-over surplus.
- */
-export function computeProratedCurrentMonthCost(
-  payments: Payment[],
-  studentId: string,
-  subject: Subject,
-  asOfKey: string,
-): number {
-  let cost = 0;
-  for (const p of payments) {
-    if (
-      p.studentId === studentId &&
-      p.subject === subject &&
-      !isPaymentFullyPaid(p) &&
-      p.dueDate <= asOfKey
-    ) {
-      cost += getPaymentRemaining(p);
-    }
-  }
-  return cost;
 }
 
 /**
@@ -922,9 +670,9 @@ export function getResteForPayments(payments: Payment[], todayKey: string): numb
   return reste;
 }
 
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 // Overdue worklist aggregation (Payments page)
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 
 /**
  * ONE aggregated worklist row per student + subject: every currently-due
@@ -1039,9 +787,9 @@ export function aggregateOverdueInstallments(
   return rows;
 }
 
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 // Settled worklist aggregation (Payments page — "Payés / أدوا الواجب" panel)
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 
 /**
  * ONE aggregated row per student + subject that HAS generated installments
@@ -1126,9 +874,9 @@ export function aggregateSettledInstallments(
   return rows;
 }
 
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 // Ledger de-duplication (defensive self-heal)
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 
 /** Logical identity of an installment — the same key `syncPayments` dedupes on. */
 function paymentLogicalKey(payment: Payment): string {
@@ -1198,10 +946,10 @@ export function dedupePayments(payments: Payment[]): PaymentDedupeResult {
   return { kept, duplicateIds };
 }
 
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 // Registration fee (رسوم التسجيل — one-time 100 DH, fully separate from
 // the Rule A/B installment engine: never flows into any installment total)
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------//
 
 /** Default one-time registration fee in MAD — editable per student. */
 export const REGISTRATION_FEE_DEFAULT = 100;

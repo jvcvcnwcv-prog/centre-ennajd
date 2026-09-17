@@ -15,11 +15,13 @@ import {
   applyCreditWaterfall,
   buildDeliveredDatesContext,
   dedupePayments,
+  earliestValidAttendanceDate,
   formatDateKey,
   generateScheduleFor,
   getPaymentRuleFor,
   isPaymentFullyPaid,
   getPaymentRemaining,
+  recalculateStudentSubjectLedger,
   reconcileRuleALedger,
   REGISTRATION_FEE_DEFAULT,
   type DeliveredDatesContext,
@@ -114,7 +116,11 @@ interface EnnajdState {
   runAutoAbsenceSweep: (now: Date) => Promise<void>;
   sweepExpiredOneOffSessions: (now: Date) => Promise<number>;
 
-  syncPayments: (now: Date) => Promise<void>;
+  syncPayments: (now: Date, opts?: { force?: boolean }) => Promise<void>;
+  recalculatePaymentsForStudentSubject: (
+    studentId: string,
+    subject: Subject,
+  ) => Promise<void>;
   setPaymentPaid: (paymentId: string, isPaid: boolean) => Promise<void>;
   recordPartialPayment: (
     studentId: string,
@@ -256,6 +262,7 @@ function generateInstallmentsForStudent(
 ): Payment[] {
   const generated: Payment[] = [];
   const ctxCache = new Map<string, DeliveredDatesContext>();
+  const state = useEnnajdState.getState();
 
   for (const enrollment of student.enrollments) {
     const rule = getPaymentRuleFor(
@@ -265,16 +272,24 @@ function generateInstallmentsForStudent(
       enrollment.track,
     );
     const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
-    const fullPrice = useEnnajdState.getState().getEffectivePrice(
-      student.id,
-      enrollment.subject,
-    );
+    // Rule A bills from the earliest ATTENDANCE date (enrollment fallback);
+    // Rule B keeps its fixed rolling cycle anchored on the enrollment date.
+    const anchor =
+      rule === "B"
+        ? enrolledAt
+        : earliestValidAttendanceDate(
+            student.id,
+            enrollment.subject,
+            state.attendanceRecords,
+            state.sessions,
+            asOfKey,
+          ) ?? enrolledAt;
+    const fullPrice = state.getEffectivePrice(student.id, enrollment.subject);
     if (fullPrice === undefined) continue;
 
-    const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}__${enrolledAt.getDay()}`;
+    const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}__${anchor.getDay()}`;
     let ctx = ctxCache.get(ctxKey);
     if (!ctx) {
-      const state = useEnnajdState.getState();
       ctx = buildDeliveredDatesContext(
         state.sessions,
         state.attendanceRecords,
@@ -284,7 +299,7 @@ function generateInstallmentsForStudent(
           track: enrollment.track,
           groupType: enrollment.groupType,
         },
-        enrolledAt,
+        anchor,
       );
       ctxCache.set(ctxKey, ctx);
     }
@@ -292,7 +307,7 @@ function generateInstallmentsForStudent(
     // Session-based engine (Rule A) / rolling cycle (Rule B): the schedule
     // already carries ABSOLUTE amounts (perSession × billable sessions),
     // resolved from getEffectivePrice (which honors customPrice).
-    const schedule = generateScheduleFor(rule, enrolledAt, asOf, ctx, fullPrice);
+    const schedule = generateScheduleFor(rule, anchor, asOf, ctx, fullPrice);
     for (const installment of schedule) {
       const key = `${student.id}__${enrollment.subject}__${installment.dueDate}`;
       if (existingKeys.has(key)) continue;
@@ -602,12 +617,30 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       };
     });
     if (savedRecord) {
-      return await persist(
+      const ok = await persist(
         prevAttendance,
         (prev) => set({ attendanceRecords: prev }),
         markAttendanceDoc(savedRecord),
         "attendanceSaveFailed",
       );
+      // REACTIVE LEDGER: an attendance mark can move the billing anchor, so
+      // re-derive this student+subject's installments once the write lands.
+      // Deferred + failure-isolated: the chip write returns immediately and
+      // a recalc failure never blocks the attendance action itself.
+      if (ok) {
+        const session = get().sessions.find((s) => s.id === sessionId);
+        if (session) {
+          queueMicrotask(() => {
+            void get()
+              .recalculatePaymentsForStudentSubject(studentId, session.subject)
+              .catch((err) => {
+                console.error("[ennajd] reactive ledger recalc failed:", err);
+                toast.warning(t("ledgerRecalcFailed"));
+              });
+          });
+        }
+      }
+      return ok;
     }
     return false;
   },
@@ -710,7 +743,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     return expired.length;
   },
 
-  syncPayments: async (now) => {
+  syncPayments: async (now, opts) => {
     // Guards run BEFORE the throttle is consumed, so an early bail (not yet
     // hydrated / no students) does not block a later deferred retry.
 
@@ -730,9 +763,14 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const state = get();
     if (state.students.length === 0) return;
 
+    // `force` (the attendance/reactive path) bypasses BOTH throttles so a
+    // re-anchor reacts immediately; every other caller keeps the
+    // once-per-minute + once-per-calendar-day guards.
+    const force = opts?.force === true;
+
     // Throttle to once per minute to avoid unnecessary computations
     const nowMs = now.getTime();
-    if (lastSyncPaymentsMs !== null && nowMs - lastSyncPaymentsMs < 60_000) {
+    if (!force && lastSyncPaymentsMs !== null && nowMs - lastSyncPaymentsMs < 60_000) {
       return;
     }
     lastSyncPaymentsMs = nowMs;
@@ -741,7 +779,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     // scan below only ever produces new rows when a new day/month/
     // enrollment appears, so re-running it every 30s tick is wasted work.
     const todayKey = formatDateKey(now);
-    if (state.lastPaymentsSyncDateKey === todayKey) return;
+    if (!force && state.lastPaymentsSyncDateKey === todayKey) return;
     set({ lastPaymentsSyncDateKey: todayKey });
 
     // Snapshot BOTH slices before any optimistic update so a failed write
@@ -828,6 +866,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       get().students,
       get().sessions,
       get().prices,
+      get().attendanceRecords,
+      todayKey,
     );
     // Rebuilt rows for the DB upsert — kept OUT of `newPayments` so they
     // are never appended twice to the local ledger (they are applied
@@ -888,6 +928,120 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       console.error("[ennajd] syncPayments write failed:", err);
       set({ payments: previousPayments, students: previousStudents });
       toast.error(t("paymentSaveFailed"));
+    }
+  },
+
+  /**
+   * REACTIVE LEDGER — re-derives ONE student+subject's Rule A installments
+   * from the attendance anchor (earliest valid attendance date, enrollment
+   * fallback) and redistributes that subject's paid credit earliest-first
+   * across the following months. Triggered (deferred) by every attendance
+   * write, so the Payments page ledger follows attendance marks without a
+   * reload. Rule B (2Bac s.x Small) is untouched.
+   *
+   * A forced `syncPayments` runs first — the attendance path's throttle
+   * bypass — so the rest of the student's ledger is current (future
+   * installments exist, advance credit consumed) before the targeted
+   * rebuild. Both passes are idempotent, so repeated triggers are safe.
+   * Failures revert + warn and never block the attendance write.
+   */
+  recalculatePaymentsForStudentSubject: async (studentId, subject) => {
+    // Never run before the ledger has hydrated — an empty local `payments`
+    // array would make the rebuild mint fresh ids for rows that still exist
+    // remotely (the same dedupe hazard `syncPayments` guards against).
+    if (!get().hasSyncedPayments) return;
+
+    const student = get().students.find((s) => s.id === studentId);
+    if (!student) return;
+
+    const now = new Date();
+    const asOfKey = formatDateKey(now);
+    // Same horizon as `syncPayments` (now + 1 month) so the credit cascade
+    // has future installments to land on.
+    const asOf = new Date(now);
+    asOf.setMonth(asOf.getMonth() + 1);
+
+    // The attendance path's forced sync — bypasses the daily throttle,
+    // leaving every other caller's guard untouched.
+    await get().syncPayments(now, { force: true });
+
+    // Re-read after the sync so the rebuild sees the current ledger.
+    const state = get();
+    const current = state.students.find((s) => s.id === studentId);
+    if (!current) return;
+
+    const result = recalculateStudentSubjectLedger(current, subject, {
+      payments: state.payments,
+      sessions: state.sessions,
+      attendanceRecords: state.attendanceRecords,
+      prices: state.prices,
+      asOf,
+      asOfKey,
+      updatedAt: now.toISOString(),
+    });
+
+    if (
+      result.toDelete.length === 0 &&
+      result.toUpsert.length === 0 &&
+      result.remainingCredit === 0
+    ) {
+      return;
+    }
+
+    const previousPayments = state.payments;
+    const previousStudents = state.students;
+    const upsertById = new Map(result.toUpsert.map((p) => [p.id, p]));
+    const deleteSet = new Set(result.toDelete);
+    let nextAdvanceBalance: number | undefined;
+
+    // Apply the diff in place: drop non-billable months, patch changed rows,
+    // append genuinely-new ones.
+    set((s) => {
+      const existingIds = new Set(s.payments.map((p) => p.id));
+      const appended = result.toUpsert.filter((p) => !existingIds.has(p.id));
+      return {
+        payments: s.payments
+          .filter((p) => !deleteSet.has(p.id))
+          .map((p) => upsertById.get(p.id) ?? p)
+          .concat(appended),
+      };
+    });
+
+    // Credit the rebuilt installments could not absorb → carried forward.
+    if (result.remainingCredit > 0) {
+      const prevBalance =
+        get().students.find((s) => s.id === studentId)?.advanceBalance ?? 0;
+      nextAdvanceBalance = prevBalance + result.remainingCredit;
+      set((s) => ({
+        students: s.students.map((st) =>
+          st.id === studentId
+            ? { ...st, advanceBalance: nextAdvanceBalance as number }
+            : st,
+        ),
+      }));
+    }
+
+    try {
+      if (result.toUpsert.length > 0) {
+        await upsertPaymentsBatchDoc(result.toUpsert);
+      }
+      if (result.toDelete.length > 0) {
+        await deletePaymentsBatchDoc(result.toDelete);
+      }
+      if (nextAdvanceBalance !== undefined) {
+        await updateStudentAdvanceBalanceDoc(studentId, nextAdvanceBalance);
+      }
+    } catch (err) {
+      console.error("[ennajd] reactive ledger recalc write failed:", err);
+      set({ payments: previousPayments, students: previousStudents });
+      toast.warning(t("ledgerRecalcFailed"));
+      return;
+    }
+
+    // Confirm only when an installment actually moved.
+    if (result.toDelete.length > 0 || result.toUpsert.length > 0) {
+      const name = `${current.firstName} ${current.lastName}`;
+      toast.success(t("ledgerRecalculated").replace("{student}", name));
     }
   },
 

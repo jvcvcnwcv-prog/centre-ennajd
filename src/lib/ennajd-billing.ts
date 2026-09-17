@@ -82,13 +82,6 @@ function normalizeDateOnly(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
 
-/** The calendar day strictly after `date` (date-only, +1 day). */
-function dayAfter(date: Date): Date {
-  const next = normalizeDateOnly(date);
-  next.setDate(next.getDate() + 1);
-  return next;
-}
-
 /**
  * Calendar-month arithmetic that clamps to the last valid day of the target
  * month (e.g. Jan 31 + 1 month → Feb 28/29, not an overflow into March).
@@ -102,6 +95,54 @@ export function addMonthsClamped(date: Date, months: number): Date {
   return target;
 }
 
+/** Parses a "YYYY-MM-DD" key into a local-calendar Date (or null when malformed). */
+function parseDateKey(key: string): Date | null {
+  const [y, m, d] = key.split("-");
+  const year = Number(y);
+  const monthIndex0 = Number(m) - 1;
+  const day = Number(d);
+  if (!Number.isFinite(year) || !Number.isFinite(monthIndex0) || !Number.isFinite(day)) {
+    return null;
+  }
+  return new Date(year, monthIndex0, day);
+}
+
+/**
+ * The reactive billing ANCHOR: the earliest non-future attendance date the
+ * given student has for the given subject. Billing for the join month starts
+ * ON this date (inclusive) — even when it predates the registration date,
+ * because a delivered session proves the cycle actually started then.
+ *
+ * A record matches when its `studentId` + `date` are present, its `sessionId`
+ * resolves to a Session of this `subject`, and `date <= asOfKey` (future-dated
+ * marks — e.g. a pre-marked upcoming class — never anchor billing). Returns
+ * `null` when the student has no valid attendance yet, in which case the
+ * caller falls back to the enrollment date.
+ *
+ * Pure — no React/Zustand, no hidden date().
+ */
+export function earliestValidAttendanceDate(
+  studentId: string,
+  subject: Subject,
+  attendanceRecords: AttendanceRecord[],
+  sessions: Session[],
+  asOfKey: string,
+): Date | null {
+  const subjectSessionIds = new Set(
+    sessions.filter((s) => s.subject === subject).map((s) => s.id),
+  );
+  let earliest: Date | null = null;
+  for (const record of attendanceRecords) {
+    if (record.studentId !== studentId) continue;
+    if (!record.date || record.date > asOfKey) continue; // ignore future marks
+    if (!subjectSessionIds.has(record.sessionId)) continue;
+    const parsed = parseDateKey(record.date);
+    if (!parsed) continue;
+    if (earliest === null || parsed < earliest) earliest = parsed;
+  }
+  return earliest;
+}
+
 // ---- Standard vs Extra helper ----
 // ONLY standard/fixed schedule counts for billing. Extra "حصة إضافية" (one_off) is 100% free.
 function isStandardSession(s: Session): boolean {
@@ -110,11 +151,16 @@ function isStandardSession(s: Session): boolean {
 
 /**
  * Which STANDARD scheduled days a given Level/Subject/Track/GroupType combo has.
- * Attendance records are IGNORED for billing (Rule 3) — a scheduled class counts as
+ * Attendance records are IGNORED for the TIMETABLE (Rule 3) — a scheduled class counts as
  * CONSUMED SESSION regardless of individual absence. Extra sessions are excluded 100% (Rule 2).
  * When no standard Session exists for the combo, `hasSession` is false and
  * `scheduledDaysOfWeek` is empty → the session-based engine emits NO installment
  * (a subject with no timetable is not billable).
+ *
+ * The attendance ANCHOR (earliest valid attendance date, enrollment fallback)
+ * is resolved separately by the caller via `earliestValidAttendanceDate()` and
+ * passed to the schedule generator as the billing start date — this context
+ * only describes the recurring timetable.
  */
 export interface DeliveredDatesContext {
   hasSession: boolean;
@@ -129,7 +175,7 @@ export interface DeliveredDatesContext {
 
 export function buildDeliveredDatesContext(
   sessions: Session[],
-  _attendanceRecords: AttendanceRecord[], // kept for signature compat — IGNORED for billing (Rule 3)
+  _attendanceRecords: AttendanceRecord[], // timetable-only here; the anchor is resolved by the caller
   combo: EnrollmentCombo,
   _enrolledAt: Date,
 ): DeliveredDatesContext {
@@ -187,19 +233,24 @@ export function getFixedSessionCount(ctx: DeliveredDatesContext): number {
 }
 
 /**
- * How many sessions a student who enrolled at `enrolledAt` will be billed
- * for in the calendar month containing `monthDate` — the count of STANDARD
- * scheduled occurrences in the billable window, capped at `fixedCount` (the
- * 5th occurrence in a month is free).
+ * How many sessions a student will be billed for in the calendar month
+ * containing `monthDate` — the count of STANDARD scheduled occurrences in
+ * the billable window, capped at `fixedCount` (the 5th occurrence in a
+ * month is free).
+ *
+ * `anchor` is the billing start date: the earliest VALID ATTENDANCE date
+ * when the student has one, otherwise the enrollment date (both are
+ * resolved by the caller). The anchor session itself IS billable — the
+ * join-month window is `[anchor, monthEnd]` INCLUSIVE.
  *
  * Returns `null` when NO installment should be emitted for that month:
  *  - the combo has no timetable (fixedCount === 0),
- *  - the month is entirely before the enrollment month,
+ *  - the month is entirely before the anchor month,
  *  - the month has zero scheduled occurrences (gap month),
  *  - the join month has ≤1 billable session left (single session = free).
  */
 function computeMonthBillable(
-  enrolledAt: Date,
+  anchor: Date,
   monthDate: Date,
   ctx: DeliveredDatesContext,
 ): number | null {
@@ -213,21 +264,20 @@ function computeMonthBillable(
     daysInMonth(monthStart.getFullYear(), monthStart.getMonth()),
   );
 
-  // Months entirely before enrollment are never billed.
-  if (monthEnd < normalizeDateOnly(enrolledAt)) return null;
+  // Months entirely before the anchor are never billed.
+  if (monthEnd < normalizeDateOnly(anchor)) return null;
 
   // Explicit gap month (term break / timetable added mid-year) → no installment.
   if (ctx.gapMonthKeys.has(formatMonthKey(monthDate))) return null;
 
   const isJoinMonth =
-    monthDate.getFullYear() === enrolledAt.getFullYear() &&
-    monthDate.getMonth() === enrolledAt.getMonth();
+    monthDate.getFullYear() === anchor.getFullYear() &&
+    monthDate.getMonth() === anchor.getMonth();
 
-  // Join month: sessions STRICTLY AFTER enrolledAt (exclusive start) — the
-  // enrollment-date session itself is never billed. Other months count the
-  // full calendar month.
+  // Join month: occurrences from the ANCHOR INCLUSIVE (the anchor session
+  // itself is billable). Other months count the full calendar month.
   const count = isJoinMonth
-    ? countOccurrencesInRange(ctx, dayAfter(enrolledAt), monthEnd)
+    ? countOccurrencesInRange(ctx, anchor, monthEnd)
     : countOccurrencesInRange(ctx, monthStart, monthEnd);
 
   // A month with zero scheduled occurrences is a gap month too.
@@ -244,9 +294,13 @@ function computeMonthBillable(
 /**
  * Expected installment amount (MAD) for one calendar month, using the
  * session-based formula: perSession × billable sessions. The join month
- * counts only the sessions STRICTLY AFTER `enrolledAt` (the
- * enrollment-date session is excluded). Returns `null` when no installment
- * should exist for that month (see computeMonthBillable).
+ * counts the sessions from `anchor` INCLUSIVE (the anchor session is
+ * billable). Returns `null` when no installment should exist for that month
+ * (see computeMonthBillable).
+ *
+ * `anchor` is the billing start date — earliest valid attendance date, or
+ * the enrollment date when the student has no attendance yet (resolved by
+ * the caller via `earliestValidAttendanceDate`).
  *
  * `price` is the monthly fee for this student+subject (already resolved with
  * customPrice by the caller). Pure — used both by the generator and by
@@ -254,7 +308,7 @@ function computeMonthBillable(
  * discounted rows.
  */
 export function computeExpectedMonthAmount(
-  enrolledAt: Date,
+  anchor: Date,
   monthKey: string, // "YYYY-MM"
   ctx: DeliveredDatesContext,
   price: number,
@@ -264,7 +318,7 @@ export function computeExpectedMonthAmount(
   const monthIndex0 = Number(monthStr) - 1;
   if (!Number.isFinite(year) || !Number.isFinite(monthIndex0)) return null;
 
-  const billable = computeMonthBillable(enrolledAt, new Date(year, monthIndex0, 1), ctx);
+  const billable = computeMonthBillable(anchor, new Date(year, monthIndex0, 1), ctx);
   if (billable === null) return null;
 
   const fixedCount = getFixedSessionCount(ctx);
@@ -276,38 +330,41 @@ export function computeExpectedMonthAmount(
  * month through `asOf`, emits one installment whose amount is
  * perSession × (sessions the student will attend that month):
  *
- *  - join month: occurrences in (enrolledAt, month-end] — strictly AFTER the
- *    enrollment date (the enrollment-date session is not billable),
+ *  - join month: occurrences in [anchor, month-end] — the anchor session
+ *    IS billable,
  *  - other months: occurrences in the full month,
  *  - billable capped at fixedCount (a 5th weekly occurrence is free),
  *  - join month with ≤1 session left → free (no installment),
- *  - gap months / pre-enrollment months / no timetable → no installment.
+ *  - gap months / pre-anchor months / no timetable → no installment.
  *
- * Due date: `enrolledAt` itself for the join month, the 1st of the month
+ * `anchor` is the billing start date — the earliest valid ATTENDANCE date
+ * when one exists, otherwise the enrollment date (both inclusive).
+ *
+ * Due date: the anchor itself for the join month, the 1st of the month
  * for every later month.
  */
 export function generateSessionBasedSchedule(
-  enrolledAt: Date,
+  anchor: Date,
   asOf: Date,
   ctx: DeliveredDatesContext,
   price: number,
 ): SessionInstallment[] {
   if (!ctx.hasSession || ctx.scheduledDaysOfWeek.length === 0) return [];
-  if (enrolledAt > asOf) return [];
+  if (anchor > asOf) return [];
 
   const fixedCount = getFixedSessionCount(ctx);
   const perSession = price / fixedCount;
 
   const results: SessionInstallment[] = [];
   const asOfMonth = startOfMonth(asOf);
-  let cursor = startOfMonth(enrolledAt);
+  let cursor = startOfMonth(anchor);
   while (cursor <= asOfMonth) {
-    const billable = computeMonthBillable(enrolledAt, cursor, ctx);
+    const billable = computeMonthBillable(anchor, cursor, ctx);
     if (billable !== null) {
       const isJoinMonth =
-        cursor.getFullYear() === enrolledAt.getFullYear() &&
-        cursor.getMonth() === enrolledAt.getMonth();
-      const dueDate = isJoinMonth ? enrolledAt : cursor;
+        cursor.getFullYear() === anchor.getFullYear() &&
+        cursor.getMonth() === anchor.getMonth();
+      const dueDate = isJoinMonth ? anchor : cursor;
       results.push({
         monthKey: formatMonthKey(cursor),
         dueDate: formatDateKey(dueDate),
@@ -399,11 +456,18 @@ export interface ReconcilePatch {
  *                stale leftovers and are removed from the ledger.
  *  - untouched — the amount already matches.
  *
- * Rule B rows are never classified. `reconcilePaymentAmounts` above is the
+ * Rule B rows are never classified. `reconcilePaymentAmounts` below is the
  * update-only subset of this (kept for `regeneratePaymentLedger`-adjacent
  * paths); this one additionally reports the rows that must go away, which
  * is what stops old full-price months from lingering on the board forever.
- * Pure — no React/Zustand, no hidden date().
+ *
+ * Expected amounts are computed from the ATTENDANCE ANCHOR
+ * (`earliestValidAttendanceDate`, enrollment fallback) — the same anchor
+ * the generator uses — so the daily self-heal never reverts a reactive
+ * re-anchoring. Pass the live `attendanceRecords` + `asOfKey`; the defaults
+ * (no attendance) reproduce the legacy enrollment-date anchor.
+ *
+ * Pure — no React/Zustand.
  */
 export interface ReconcileLedgerResult {
   update: ReconcilePatch[];
@@ -415,6 +479,8 @@ export function reconcileRuleALedger(
   students: Student[],
   sessions: Session[],
   prices: PriceEntry[],
+  attendanceRecords: AttendanceRecord[] = [],
+  asOfKey?: string,
 ): ReconcileLedgerResult {
   const studentsById = new Map(students.map((s) => [s.id, s]));
   const update: ReconcilePatch[] = [];
@@ -445,19 +511,29 @@ export function reconcileRuleALedger(
     }
 
     const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+    const anchor =
+      asOfKey !== undefined
+        ? earliestValidAttendanceDate(
+            payment.studentId,
+            payment.subject,
+            attendanceRecords,
+            sessions,
+            asOfKey,
+          ) ?? enrolledAt
+        : enrolledAt;
     const ctx = buildDeliveredDatesContext(
       sessions,
-      [],
+      attendanceRecords,
       {
         level: student.level,
         subject: enrollment.subject,
         track: enrollment.track,
         groupType: enrollment.groupType,
       },
-      enrolledAt,
+      anchor,
     );
 
-    const expected = computeExpectedMonthAmount(enrolledAt, payment.month, ctx, price);
+    const expected = computeExpectedMonthAmount(anchor, payment.month, ctx, price);
     if (expected === null) {
       // No timetable / gap month / pre-enrollment month → no installment.
       del.push(payment.id);
@@ -482,13 +558,17 @@ export function reconcileRuleALedger(
  * migration). `isPaid` is recomputed strictly from `amountPaid` — a row
  * stays paid only when the paid amount covers the new expected amount.
  * Rule B rows and rows whose expected amount is null (no timetable / gap
- * month) are left untouched. Pure — the store layer applies the patches.
+ * month) are left untouched. Expected amounts use the same ATTENDANCE
+ * ANCHOR as the generator (defaults reproduce the legacy enrollment anchor).
+ * Pure — the store layer applies the patches.
  */
 export function reconcilePaymentAmounts(
   payments: Payment[],
   students: Student[],
   sessions: Session[],
   prices: PriceEntry[],
+  attendanceRecords: AttendanceRecord[] = [],
+  asOfKey?: string,
 ): ReconcilePatch[] {
   const studentsById = new Map(students.map((s) => [s.id, s]));
   const patches: ReconcilePatch[] = [];
@@ -508,19 +588,29 @@ export function reconcilePaymentAmounts(
     if (price === undefined) continue;
 
     const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+    const anchor =
+      asOfKey !== undefined
+        ? earliestValidAttendanceDate(
+            payment.studentId,
+            payment.subject,
+            attendanceRecords,
+            sessions,
+            asOfKey,
+          ) ?? enrolledAt
+        : enrolledAt;
     const ctx = buildDeliveredDatesContext(
       sessions,
-      [],
+      attendanceRecords,
       {
         level: student.level,
         subject: enrollment.subject,
         track: enrollment.track,
         groupType: enrollment.groupType,
       },
-      enrolledAt,
+      anchor,
     );
 
-    const expected = computeExpectedMonthAmount(enrolledAt, payment.month, ctx, price);
+    const expected = computeExpectedMonthAmount(anchor, payment.month, ctx, price);
     if (expected === null || expected === payment.amountDue) continue;
 
     patches.push({
@@ -533,11 +623,198 @@ export function reconcilePaymentAmounts(
   return patches;
 }
 
+// ---------------------------------------------------------------------------//
+// Reactive ledger recalculation — the attendance-anchored diff a single
+// markAttendance triggers. Rebuilds ONE student+subject's Rule A
+// installments from the attendance anchor and redistributes that subject's
+// already-paid credit earliest-first (the same waterfall a fresh full sync
+// uses), so a re-anchor both pulls credit back (shortfall) and pushes it
+// forward (surplus) across the following months.
+// ---------------------------------------------------------------------------//
+
+/** State slices the reactive recalc needs — the store passes them in. */
+export interface RecalculateLedgerContext {
+  payments: Payment[];
+  sessions: Session[];
+  attendanceRecords: AttendanceRecord[];
+  prices: PriceEntry[];
+  /** Generate installments through this date (syncPayments-style: now + 1 month). */
+  asOf: Date;
+  /** "YYYY-MM-DD" — the reference for ignoring future-dated attendance. */
+  asOfKey: string;
+  /** ISO timestamp stamped on every emitted/updated row. */
+  updatedAt: string;
+}
+
+export interface RecalculateResult {
+  /** Existing Rule A row ids whose month is no longer billable — the
+   *  sessions they billed no longer exist, so they are deleted. Their paid
+   *  credit is returned to the pool and re-distributed by the waterfall. */
+  toDelete: string[];
+  /** New + changed installments, upsertable by id. Rows are only shipped
+   *  when they genuinely differ from what is already on the ledger. */
+  toUpsert: Payment[];
+  /** Credit the rebuilt installments could not absorb — the caller adds it
+   *  to the student's `advanceBalance`. */
+  remainingCredit: number;
+}
+
 /**
- * Resolves the monthly fee for one enrollment: `customPrice` wins over the
- * base PriceEntry (Takhfid). Returns undefined when no price is defined at
- * all (not billable).
+ * Rebuilds one student+subject's Rule A ledger against the current state,
+ * anchored on the earliest valid attendance date (enrollment fallback).
+ *
+ * The rebuilt schedule comes from the exact same path a fresh full sync
+ * uses (`generateSessionBasedSchedule` over the resolved anchor + price),
+ * and the paid credit accumulated on the subject's existing installments
+ * is pooled and re-run through `applyCreditWaterfall` — so:
+ *
+ *  - a month whose charge GREW pulls credit back from the following months,
+ *  - a month whose charge SHRANK pushes surplus forward,
+ *  - a month that stopped being billable (e.g. the join month drops to a
+ *    single session → free) is deleted and its credit re-distributed,
+ *  - a settled installment only moves when its amount actually changes.
+ *
+ * Idempotent: the same attendance set yields the same installments and the
+ * same credit distribution. Rule B (2Bac s.x Small Math/PC/SVT) is never
+ * touched — its fixed rolling engine ignores attendance. Pure — no
+ * React/Zustand.
  */
+export function recalculateStudentSubjectLedger(
+  student: Student,
+  subject: Subject,
+  ctx: RecalculateLedgerContext,
+): RecalculateResult {
+  const existing = ctx.payments.filter(
+    (p) => p.studentId === student.id && p.subject === subject && p.rule === "A",
+  );
+  const creditOf = (rows: Payment[]) => rows.reduce((sum, p) => sum + (p.amountPaid ?? 0), 0);
+
+  const enrollment = student.enrollments.find((e) => e.subject === subject);
+  // No enrollment left → the subject isn't billed; its rows are stale.
+  if (!enrollment) {
+    return {
+      toDelete: existing.map((p) => p.id),
+      toUpsert: [],
+      remainingCredit: creditOf(existing),
+    };
+  }
+
+  // Rule B keeps its fixed rolling engine regardless of attendance marks.
+  if (
+    getPaymentRuleFor(
+      student.level,
+      subject,
+      enrollment.groupType,
+      enrollment.track,
+    ) === "B"
+  ) {
+    return { toDelete: [], toUpsert: [], remainingCredit: 0 };
+  }
+
+  const price = getEffectivePriceFor(student, enrollment, ctx.prices);
+  // Price removed entirely → nothing to charge.
+  if (price === undefined) {
+    return {
+      toDelete: existing.map((p) => p.id),
+      toUpsert: [],
+      remainingCredit: creditOf(existing),
+    };
+  }
+
+  // The anchor: earliest valid attendance date, else the enrollment date.
+  const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+  const anchor =
+    earliestValidAttendanceDate(
+      student.id,
+      subject,
+      ctx.attendanceRecords,
+      ctx.sessions,
+      ctx.asOfKey,
+    ) ?? enrolledAt;
+
+  const comboCtx = buildDeliveredDatesContext(
+    ctx.sessions,
+    ctx.attendanceRecords,
+    {
+      level: student.level,
+      subject,
+      track: enrollment.track,
+      groupType: enrollment.groupType,
+    },
+    anchor,
+  );
+
+  const schedule = generateSessionBasedSchedule(anchor, ctx.asOf, comboCtx, price);
+
+  // Pool the credit already applied to this subject's installments — the
+  // rebuild redistributes it earliest-first over the new schedule.
+  const creditPool = creditOf(existing);
+
+  // One representative row per calendar month (the most-settled one, same
+  // rule as `dedupePayments`) — its id is reused for the rebuilt row. A
+  // re-anchor moves the join-month dueDate, which makes the daily sync's
+  // `studentId__subject__dueDate` dedupe mint a surplus row for the same
+  // month; those are reported for deletion below so the ledger stays
+  // exactly one row per month.
+  const priorByMonth = new Map<string, Payment>();
+  for (const p of existing) {
+    const current = priorByMonth.get(p.month);
+    if (!current || isMoreSettledPayment(p, current)) priorByMonth.set(p.month, p);
+  }
+
+  const rebuilt: Payment[] = schedule.map((installment) => {
+    const prior = priorByMonth.get(installment.monthKey);
+    return {
+      id: prior?.id ?? crypto.randomUUID(),
+      studentId: student.id,
+      subject,
+      dueDate: installment.dueDate,
+      month: installment.monthKey,
+      isPaid: false,
+      amountDue: installment.amount,
+      amountPaid: 0,
+      isHalfMonth: false,
+      rule: "A",
+      updatedAt: ctx.updatedAt,
+    };
+  });
+
+  // Re-distribute the pooled credit across the rebuilt installments,
+  // dueDate ascending — exactly the waterfall a fresh sync would run.
+  const { updated, remaining } = applyCreditWaterfall(
+    rebuilt,
+    student.id,
+    subject,
+    creditPool,
+    ctx.asOfKey,
+    ctx.updatedAt,
+  );
+  const creditedById = new Map(updated.map((p) => [p.id, p]));
+  const finalRows = rebuilt.map((p) => creditedById.get(p.id) ?? p);
+
+  // Ship only rows that genuinely differ from the current ledger.
+  const priorById = new Map(existing.map((p) => [p.id, p]));
+  const toUpsert = finalRows.filter((p) => {
+    const prior = priorById.get(p.id);
+    return (
+      !prior ||
+      prior.amountDue !== p.amountDue ||
+      prior.dueDate !== p.dueDate ||
+      prior.amountPaid !== p.amountPaid ||
+      prior.isPaid !== p.isPaid
+    );
+  });
+
+  // Delete every row that is no longer the month's representative: months
+  // that stopped being billable, plus surplus duplicates of a billable
+  // month.
+  const reusedIds = new Set(finalRows.map((p) => p.id));
+  const toDelete = existing.filter((p) => !reusedIds.has(p.id)).map((p) => p.id);
+
+  return { toDelete, toUpsert, remainingCredit: remaining };
+}
+
+
 export function getEffectivePriceFor(
   student: Student,
   enrollment: SubjectEnrollment,

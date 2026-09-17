@@ -387,6 +387,9 @@ const dictionary = {
       "Le paiement n'a pas pu être enregistré. Vos modifications locales ont été annulées — réessayez.",
     sessionSaveFailed: "Échec de l'enregistrement de la séance",
     attendanceSaveFailed: "Échec de l'enregistrement de la présence",
+    ledgerRecalculated: "Compte recalculé pour {student}",
+    ledgerRecalcFailed:
+      "Le recalcul du compte a échoué — la présence est bien enregistrée. Il sera mis à jour à la prochaine synchronisation.",
     studentSaveFailed: "Échec de l'enregistrement de l'élève",
     studentDeleteFailed: "Échec de la suppression de l'élève",
     sessionDeleteFailed: "Échec de la suppression de la séance",
@@ -771,6 +774,9 @@ const dictionary = {
       "تعذر حفظ الدفع. تم إلغاء التغييرات المحلية — حاول مرة أخرى.",
     sessionSaveFailed: "فشل حفظ الحصة",
     attendanceSaveFailed: "فشل حفظ الحضور",
+    ledgerRecalculated: "تمت إعادة حساب كشف الرسوم لـ {student}",
+    ledgerRecalcFailed:
+      "فشلت إعادة حساب كشف الرسوم — تم حفظ الحضور بنجاح وسيتم تحديثه عند المزامنة القادمة.",
     studentSaveFailed: "فشل حفظ الطالب",
     studentDeleteFailed: "فشل حذف الطالب",
     sessionDeleteFailed: "فشل حذف الحصة",

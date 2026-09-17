@@ -8,8 +8,15 @@ import { sortStudentsAlphabetically, type AcademicMonth } from "@/lib/ennajd-rep
 import {
   buildDeliveredDatesContext,
   computeExpectedMonthAmount,
+  earliestValidAttendanceDate,
 } from "@/lib/ennajd-billing";
-import type { Payment, Session, Student, Subject } from "@/types/ennajd";
+import type {
+  AttendanceRecord,
+  Payment,
+  Session,
+  Student,
+  Subject,
+} from "@/types/ennajd";
 
 export interface PaymentCell {
   amountDue: number;
@@ -19,6 +26,9 @@ export interface PaymentCell {
   isPaid: boolean;
   /** True when at least one installment is fully or partially counted as paid. */
   isPartiallyPaid: boolean;
+  /** MAD of pre-paid/advance credit sitting on this month (amountPaid when
+   *  the month is not fully covered, 0 otherwise) — the green chip value. */
+  advanceCredit: number;
   /** MAD still owed for this month (amountDue - amountPaid). */
   remaining: number;
   isHalfMonth: boolean;
@@ -57,40 +67,58 @@ export function buildPaymentMatrix(
   months: AcademicMonth[],
   basePrice: number | undefined,
   sessions: Session[],
+  attendanceRecords: AttendanceRecord[],
+  asOfKey: string,
 ): PaymentMatrix {
   const sortedStudents = sortStudentsAlphabetically(students);
 
   const totalsByMonth = new Map<string, number>();
   for (const month of months) totalsByMonth.set(month.key, 0);
 
+  const subjectSessionIds = new Set(
+    sessions.filter((s) => s.subject === subject).map((s) => s.id),
+  );
+
   const rows: PaymentMatrixRow[] = sortedStudents.map((student) => {
     const cellsByMonth = new Map<string, PaymentCell | null>();
     const studentPayments = payments.filter(
       (p) => p.studentId === student.id && p.subject === subject,
     );
+    const studentAttendance = attendanceRecords.filter(
+      (r) => r.studentId === student.id && subjectSessionIds.has(r.sessionId),
+    );
 
-    // Expected amounts are derived from the student's own enrollment + the
-    // combo's timetable, so a mid-month join is recognized as full-price or
-    // prorated rather than "discounted".
+    // Expected amounts are derived from the student's own anchor (earliest
+    // PRESENT attendance date, enrollment fallback) + the combo's timetable,
+    // so a mid-month join is recognized as full-price or prorated rather than
+    // "discounted". The anchor mirrors the billing engine exactly.
     const enrollment = student.enrollments.find((e) => e.subject === subject);
     const expectedByMonth = new Map<string, number | null>();
     if (enrollment && basePrice !== undefined) {
       const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+      const anchor =
+        earliestValidAttendanceDate(
+          student.id,
+          subject,
+          studentAttendance,
+          sessions,
+          asOfKey,
+        ) ?? enrolledAt;
       const ctx = buildDeliveredDatesContext(
         sessions,
-        [],
+        studentAttendance,
         {
           level: student.level,
           subject,
           track: enrollment.track,
           groupType: enrollment.groupType,
         },
-        enrolledAt,
+        anchor,
       );
       for (const month of months) {
         expectedByMonth.set(
           month.key,
-          computeExpectedMonthAmount(enrolledAt, month.key, ctx, basePrice),
+          computeExpectedMonthAmount(anchor, month.key, ctx, basePrice),
         );
       }
     }
@@ -125,6 +153,7 @@ export function buildPaymentMatrix(
         amountPaid,
         isPaid,
         isPartiallyPaid,
+        advanceCredit: isPartiallyPaid ? amountPaid : 0,
         remaining,
         isHalfMonth,
         isDiscounted,

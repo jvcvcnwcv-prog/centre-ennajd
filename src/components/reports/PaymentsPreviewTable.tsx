@@ -70,22 +70,29 @@ export function PaymentsPreviewTable({ matrix, lang, subject }: PaymentsPreviewT
                             type="button"
                             className={cn(
                               "inline-flex items-center gap-0.5 rounded-lg px-2 py-1 text-xs font-semibold ring-1 ring-transparent transition hover:ring-primary/40",
-                              cell.isPaid
+                              cell.isPaid || cell.advanceCredit > 0
                                 ? "bg-success/15 text-success"
                                 : "bg-destructive/10 text-destructive",
                             )}
                           >
-                            {cell.amountDue}
+                            {cell.isPaid || cell.advanceCredit === 0
+                              ? cell.amountDue
+                              : cell.advanceCredit}
                             {cell.isDiscounted && <span className="text-accent">*</span>}
                           </button>
                         </PaymentCellPopover>
                       </TooltipTrigger>
                       {cell.isDiscounted && <TooltipContent>{t("discountedPrice")}</TooltipContent>}
                     </Tooltip>
-                    {!cell.isPaid && cell.isPartiallyPaid && (
-                      <p className="mt-1 whitespace-nowrap text-[10px] font-bold text-accent-foreground">
-                        {t("remainingAmount")} {cell.remaining}
-                      </p>
+                    {!cell.isPaid && cell.advanceCredit > 0 && (
+                      <div className="mt-1 flex flex-col items-center gap-0.5">
+                        <span className="inline-flex whitespace-nowrap rounded-full bg-success/15 px-1.5 text-[9px] font-bold text-success">
+                          {t("advanceCreditBadge")}
+                        </span>
+                        <p className="whitespace-nowrap text-[10px] font-bold text-muted-foreground">
+                          {t("remainingAmount")} {cell.remaining}
+                        </p>
+                      </div>
                     )}
                   </TableCell>
                 );

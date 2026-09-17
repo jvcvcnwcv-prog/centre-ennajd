@@ -288,6 +288,38 @@ describe("reactive ledger — markAttendance trigger", () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 
+  it("deletes stale rows BEFORE upserting rebuilt ones (unique-constraint safe)", async () => {
+    // Two rows share the Sept month; the 10/09 mark re-anchors Sept onto a
+    // new dueDate. The rebuild reuses one row and must delete the surplus
+    // BEFORE the insert, or the unique(student, subject, due_date) index
+    // would reject the whole batch.
+    seedRuleALedger([
+      payment("sept", "2026-09-15", 219),
+      payment("sept-dup", "2026-09-17", 100),
+      payment("oct", "2026-10-01", 350),
+      payment("nov", "2026-11-01", 350),
+    ]);
+
+    await useEnnajdState
+      .getState()
+      .markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
+    await flushReactive();
+
+    const db = await import("@/lib/dbServices");
+    const deleteOrders = vi.mocked(db.deletePaymentsBatchDoc).mock.invocationCallOrder;
+    const upsertOrders = vi.mocked(db.upsertPaymentsBatchDoc).mock.invocationCallOrder;
+    expect(deleteOrders.length).toBeGreaterThan(0);
+    expect(upsertOrders.length).toBeGreaterThan(0);
+    // The recalc's own delete lands before its own upsert.
+    expect(deleteOrders.at(-1)!).toBeLessThan(upsertOrders.at(-1)!);
+
+    // Exactly one row per month survived the rebuild.
+    const months = useEnnajdState.getState().payments.map((p) => p.month);
+    const counts = new Map<string, number>();
+    for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
+    for (const count of counts.values()) expect(count).toBe(1);
+  });
+
   it("never blocks on a persistence failure (warning toast, kept attendance)", async () => {
     seedRuleALedger([payment("sept", "2026-09-15", 219)]);
     mockState.failNextPaymentBatch = true;
@@ -380,5 +412,80 @@ describe("reactive ledger — markAttendance trigger", () => {
     ]);
     // Nothing moved, so no confirmation toast.
     expect(toast.success).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------//
+// regeneratePaymentLedger — the manual "recalculate installments" button.
+// ---------------------------------------------------------------------------//
+
+describe("regeneratePaymentLedger", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetStore();
+    // The db mocks accumulate calls across this file's tests — clear them so
+    // this block can assert exact call counts and call ORDER.
+    vi.clearAllMocks();
+  });
+
+  it("rebuilds Rule A, keeps Rule B, and deletes before inserting", async () => {
+    seedRuleALedger([
+      payment("sept", "2026-09-15", 219),
+      payment("oct", "2026-10-01", 350),
+      payment("ruleB", "2026-10-15", 500, "B"),
+    ]);
+
+    const ok = await useEnnajdState.getState().regeneratePaymentLedger();
+    expect(ok).toBe(true);
+
+    const db = await import("@/lib/dbServices");
+    const deleteCalls = vi.mocked(db.deletePaymentsBatchDoc).mock.calls;
+    const upsertCalls = vi.mocked(db.upsertPaymentsBatchDoc).mock.calls;
+
+    // Every Rule A row is deleted before the rebuild is inserted.
+    expect(deleteCalls).toHaveLength(1);
+    expect(deleteCalls[0][0]).toEqual(["sept", "oct"]);
+    expect(upsertCalls).toHaveLength(1);
+    expect(
+      vi.mocked(db.deletePaymentsBatchDoc).mock.invocationCallOrder[0]!,
+    ).toBeLessThan(
+      vi.mocked(db.upsertPaymentsBatchDoc).mock.invocationCallOrder[0]!,
+    );
+
+    // DB constraints guarded on the shipped rows: one row per natural key,
+    // and every amountDue strictly positive (check (amount_due > 0)).
+    const keys = new Set<string>();
+    for (const p of upsertCalls[0][0]) {
+      expect(p.amountDue).toBeGreaterThan(0);
+      const key = `${p.studentId}__${p.subject}__${p.dueDate}`;
+      expect(keys.has(key)).toBe(false);
+      keys.add(key);
+    }
+
+    // Rule B is never part of the rebuild nor deleted.
+    expect(upsertCalls[0][0].find((p) => p.id === "ruleB")).toBeUndefined();
+    expect(useEnnajdState.getState().payments.filter((p) => p.rule === "B"))
+      .toHaveLength(1);
+  });
+
+  it("rolls back and surfaces the real DB error when the write fails", async () => {
+    seedRuleALedger([payment("sept", "2026-09-15", 219)]);
+    mockState.failNextPaymentBatch = true;
+
+    const ok = await useEnnajdState.getState().regeneratePaymentLedger();
+    expect(ok).toBe(false);
+
+    // The toast carries the actual failure reason, not a generic message.
+    expect(toast.error).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        description: expect.stringContaining("simulated offline failure"),
+      }),
+    );
+    // The local ledger is rolled back to its pre-rebuild state.
+    expect(useEnnajdState.getState().payments.map((p) => p.id)).toEqual([
+      "sept",
+    ]);
   });
 });

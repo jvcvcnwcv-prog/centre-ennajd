@@ -385,6 +385,7 @@ const dictionary = {
     paymentSaveFailed: "Échec de l'enregistrement du paiement",
     paymentSaveFailedHint:
       "Le paiement n'a pas pu être enregistré. Vos modifications locales ont été annulées — réessayez.",
+    paymentSaveFailedDetail: "Détail : {details}",
     sessionSaveFailed: "Échec de l'enregistrement de la séance",
     attendanceSaveFailed: "Échec de l'enregistrement de la présence",
     ledgerRecalculated: "Compte recalculé pour {student}",
@@ -397,6 +398,7 @@ const dictionary = {
     messageSaveFailed: "Échec de l'enregistrement du message",
     saveFailed: "Échec de l'enregistrement",
     advanceCredit: "Crédit d'avance",
+    advanceCreditBadge: "Crédit d'avance",
     advanceApplied: "Crédit d'avance appliqué",
     advanceCreditCarryOver:
       "{amount} MAD seront appliqués à la facture du mois prochain",
@@ -772,6 +774,7 @@ const dictionary = {
     paymentSaveFailed: "فشل حفظ الدفع",
     paymentSaveFailedHint:
       "تعذر حفظ الدفع. تم إلغاء التغييرات المحلية — حاول مرة أخرى.",
+    paymentSaveFailedDetail: "التفاصيل: {details}",
     sessionSaveFailed: "فشل حفظ الحصة",
     attendanceSaveFailed: "فشل حفظ الحضور",
     ledgerRecalculated: "تمت إعادة حساب كشف الرسوم لـ {student}",
@@ -784,6 +787,7 @@ const dictionary = {
     messageSaveFailed: "فشل حفظ الرسالة",
     saveFailed: "فشل الحفظ",
     advanceCredit: "رصيد مقدماً",
+    advanceCreditBadge: "رصيد مسبق",
     advanceApplied: "تم تطبيق الرصيد المتقدّن",
     advanceCreditCarryOver:
       "سيتم تطبيق {amount} درهم على فاتورة الشهر القادم",

@@ -121,8 +121,17 @@ export function ReportGenerator() {
   const paymentMatrix = useMemo(() => {
     if (!scope || !subject) return null;
     const enrolledRoster = getEnrolledStudentsForCombo(students, scope);
-    return buildPaymentMatrix(enrolledRoster, payments, subject, academicMonths, basePrice, matchingSessions);
-  }, [scope, subject, students, payments, academicMonths, basePrice]);
+    return buildPaymentMatrix(
+      enrolledRoster,
+      payments,
+      subject,
+      academicMonths,
+      basePrice,
+      matchingSessions,
+      attendanceRecords,
+      todayKey,
+    );
+  }, [scope, subject, students, payments, academicMonths, basePrice, attendanceRecords, todayKey]);
 
   const canGenerate = (attendanceChecked || paymentsChecked) && roster.length > 0;
 

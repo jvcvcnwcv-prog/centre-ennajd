@@ -108,15 +108,18 @@ function parseDateKey(key: string): Date | null {
 }
 
 /**
- * The reactive billing ANCHOR: the earliest non-future attendance date the
- * given student has for the given subject. Billing for the join month starts
- * ON this date (inclusive) — even when it predates the registration date,
- * because a delivered session proves the cycle actually started then.
+ * The reactive billing ANCHOR: the earliest non-future PRESENT attendance
+ * date the given student has for the given subject. Billing for the join
+ * month starts ON this date (inclusive) — even when it predates the
+ * registration date, because a delivered session proves the cycle actually
+ * started then.
  *
- * A record matches when its `studentId` + `date` are present, its `sessionId`
- * resolves to a Session of this `subject`, and `date <= asOfKey` (future-dated
- * marks — e.g. a pre-marked upcoming class — never anchor billing). Returns
- * `null` when the student has no valid attendance yet, in which case the
+ * A record matches when its `studentId` + `date` are present, its `status`
+ * is `"present"` (auto-absence marks NEVER anchor billing — a delivered
+ * session is proven only by attendance), its `sessionId` resolves to a
+ * Session of this `subject`, and `date <= asOfKey` (future-dated marks —
+ * e.g. a pre-marked upcoming class — never anchor billing). Returns `null`
+ * when the student has no valid PRESENT attendance yet, in which case the
  * caller falls back to the enrollment date.
  *
  * Pure — no React/Zustand, no hidden date().
@@ -134,6 +137,7 @@ export function earliestValidAttendanceDate(
   let earliest: Date | null = null;
   for (const record of attendanceRecords) {
     if (record.studentId !== studentId) continue;
+    if (record.status !== "present") continue; // absence never anchors billing
     if (!record.date || record.date > asOfKey) continue; // ignore future marks
     if (!subjectSessionIds.has(record.sessionId)) continue;
     const parsed = parseDateKey(record.date);
@@ -238,8 +242,8 @@ export function getFixedSessionCount(ctx: DeliveredDatesContext): number {
  * the billable window, capped at `fixedCount` (the 5th occurrence in a
  * month is free).
  *
- * `anchor` is the billing start date: the earliest VALID ATTENDANCE date
- * when the student has one, otherwise the enrollment date (both are
+ * `anchor` is the billing start date: the earliest VALID (PRESENT) ATTENDANCE
+ * date when the student has one, otherwise the enrollment date (both are
  * resolved by the caller). The anchor session itself IS billable — the
  * join-month window is `[anchor, monthEnd]` INCLUSIVE.
  *
@@ -298,9 +302,9 @@ function computeMonthBillable(
  * billable). Returns `null` when no installment should exist for that month
  * (see computeMonthBillable).
  *
- * `anchor` is the billing start date — earliest valid attendance date, or
- * the enrollment date when the student has no attendance yet (resolved by
- * the caller via `earliestValidAttendanceDate`).
+ * `anchor` is the billing start date — earliest valid PRESENT attendance
+ * date, or the enrollment date when the student has no attendance yet
+ * (resolved by the caller via `earliestValidAttendanceDate`).
  *
  * `price` is the monthly fee for this student+subject (already resolved with
  * customPrice by the caller). Pure — used both by the generator and by
@@ -721,7 +725,8 @@ export function recalculateStudentSubjectLedger(
     };
   }
 
-  // The anchor: earliest valid attendance date, else the enrollment date.
+  // The anchor: earliest valid PRESENT attendance date, else the enrollment
+  // date. Absence records never anchor billing.
   const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
   const anchor =
     earliestValidAttendanceDate(

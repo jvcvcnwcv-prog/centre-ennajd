@@ -3,18 +3,6 @@ import { TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { useI18n } from "@/lib/i18n";
 
-export function HalfMonthBadge() {
-  const { t } = useI18n();
-  return (
-    <Badge
-      variant="outline"
-      className="rounded-full border-accent/40 bg-accent/10 text-accent-foreground"
-    >
-      {t("halfMonth")}
-    </Badge>
-  );
-}
-
 export function OverdueBadge() {
   const { t } = useI18n();
   return (

@@ -385,11 +385,21 @@ export async function updatePaymentsBatchDoc(
         updates.amount_paid = Math.max(0, Math.round(fields.amountPaid));
       }
       if (Object.keys(updates).length <= 1) continue; // nothing to patch besides ts
-      const { error } = await supabase
+      const { error, count } = await supabase
         .from("payments")
-        .update(updates as never)
+        .update(updates as never, { count: "exact" })
         .eq("id", id);
       assertNoError(error);
+      // A 0-row update means the store holds a row the DB no longer has (a
+      // silent no-op that used to be invisible). Surface it as a warning so a
+      // store/DB drift never goes undetected.
+      if (count === 0) {
+        console.warn(
+          "[dbServices] updatePaymentsBatchDoc: 0 rows matched id",
+          id,
+          "(store/DB drift — the installment no longer exists remotely)",
+        );
+      }
     }
   }
 }

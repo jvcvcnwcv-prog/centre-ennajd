@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { AdjustBalanceDialog } from "@/components/payments/AdjustBalanceDialog";
-import { HalfMonthBadge, OverdueBadge } from "@/components/payments/PaymentStatusBadge";
+import { OverdueBadge } from "@/components/payments/PaymentStatusBadge";
 import { RecordPartialPaymentDialog } from "@/components/payments/RecordPartialPaymentDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -197,7 +197,6 @@ export function PaymentRuleTable({
                   <TableCell>
                     <div className="flex flex-wrap items-center gap-1">
                       <span>{row.subject}</span>
-                      {row.isHalfMonth && <HalfMonthBadge />}
                     </div>
                   </TableCell>
                   <TableCell>
@@ -342,7 +341,6 @@ export function PaymentRuleTable({
                     {groupLabel}
                   </Badge>
                 )}
-                {row.isHalfMonth && <HalfMonthBadge />}
                 {row.isOverdue && <OverdueBadge />}
                 <span
                   className={cn(

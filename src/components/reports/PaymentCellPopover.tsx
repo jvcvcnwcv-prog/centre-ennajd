@@ -114,11 +114,6 @@ export function PaymentCellPopover({
                     <span className="text-xs font-bold text-primary">
                       {payment.amountDue} MAD
                     </span>
-                    {payment.isHalfMonth && (
-                      <Badge className="rounded-full bg-accent/15 px-1.5 text-[10px] font-bold text-accent-foreground">
-                        ½ {t("halfMonth")}
-                      </Badge>
-                    )}
                   </div>
                   <div>
                     {paid ? (
@@ -127,8 +122,8 @@ export function PaymentCellPopover({
                         {t("paid")}
                       </Badge>
                     ) : partial ? (
-                      <Badge className="gap-1 rounded-full bg-accent/15 px-2 text-[10px] font-bold text-accent-foreground">
-                        {t("partialPill")} · {t("remainingAmount")} {remaining}
+                      <Badge className="gap-1 rounded-full bg-success/15 px-2 text-[10px] font-bold text-success">
+                        {t("advanceCreditBadge")} · {t("remainingAmount")} {remaining}
                       </Badge>
                     ) : (
                       <Badge className="gap-1 rounded-full bg-destructive/10 px-2 text-[10px] font-bold text-destructive">

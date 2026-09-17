@@ -741,6 +741,28 @@ describe("reconcileRuleALedger", () => {
     expect(result.delete).toEqual([]);
     expect(result.update).toEqual([{ id: "p1", amountDue: 400, isPaid: false }]);
   });
+
+  it("ignores an ABSENT record and keeps the enrollment anchor", () => {
+    // Enrolled Jan 15 with an auto-absence mark on Jan 8 — absence never
+    // anchors billing, so the window stays [Jan 15, month-end] = 3 sessions
+    // → 300, not the 400 a Jan-8 anchor would give.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-15", 200, 0, false),
+    ];
+    const attendance: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-3", "2025-01-08", "absent"),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent(`2025-01-15${NOON}`)],
+      sessions,
+      prices,
+      attendance,
+      "2025-01-31",
+    );
+    expect(result.delete).toEqual([]);
+    expect(result.update).toEqual([{ id: "p1", amountDue: 300, isPaid: false }]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -914,6 +936,21 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
     expect(sept!.dueDate).toBe("2026-09-10");
   });
 
+  it("bills Sept 2026 at 306 DH when 7 of 8 sessions remain (7 × 43.75)", () => {
+    // Attendance anchored on Tue 08/09 (inclusive): 8, 15, 22, 29 (Tue) +
+    // 10, 17, 24 (Thu) = 7 sessions → 7 × 43.75 = 306.25 → 306.
+    const schedule = generateSessionBasedSchedule(
+      new Date(2026, 8, 8), // attendance anchor 2026-09-08 (Tuesday)
+      new Date(2026, 10, 15),
+      TUE_THU_CTX,
+      PRICE_350,
+    );
+    const sept = schedule.find((s) => s.monthKey === "2026-09");
+    expect(sept).toBeDefined();
+    expect(sept!.amount).toBe(306);
+    expect(sept!.dueDate).toBe("2026-09-08");
+  });
+
   it("bills Oct 2026 at the full 350 DH (9 occurrences capped at 8), due on the 1st", () => {
     const schedule = generateSessionBasedSchedule(
       ENROLLED,
@@ -1069,6 +1106,28 @@ describe("earliestValidAttendanceDate", () => {
     expect(
       earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
     ).toEqual(new Date(2026, 8, 15));
+  });
+
+  it("ignores ABSENT records — only a PRESENT mark anchors billing", () => {
+    // An auto-absence sweep mark from 01/09 must not move the anchor; the
+    // earliest PRESENT mark (15/09) does.
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-01", "absent"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-15", "present"),
+    ];
+    expect(
+      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
+    ).toEqual(new Date(2026, 8, 15));
+  });
+
+  it("returns null when the earliest marks are all absent", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-01", "absent"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-15", "absent"),
+    ];
+    expect(
+      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
+    ).toBeNull();
   });
 });
 

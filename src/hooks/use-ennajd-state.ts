@@ -176,6 +176,40 @@ function makeId(): string {
 }
 
 /**
+ * Extracts the meaningful technical detail of a persistence failure —
+ * Supabase/PostgREST errors carry `code`/`message`/`details`, plain Errors
+ * only a `message`. Used so a payment write failure shows the REAL reason
+ * (unique-constraint violation, check constraint, RLS…) instead of a generic
+ * "something went wrong".
+ */
+function summarizePersistenceError(err: unknown): string {
+  if (err && typeof err === "object") {
+    const e = err as { code?: string; message?: string; details?: string };
+    const parts = [e.code, e.message, e.details].filter(
+      (v): v is string => typeof v === "string" && v.length > 0,
+    );
+    if (parts.length > 0) return parts.join(" · ");
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+/**
+ * Logs a payment-write failure with its full technical detail and surfaces a
+ * translated toast that includes that detail, so a Supabase rejection (unique
+ * constraint, `check (amount_due > 0)`, RLS…) is visible instead of swallowed.
+ */
+function logPaymentWriteFailure(scope: string, err: unknown): void {
+  console.error(`[ennajd] ${scope} failed:`, err);
+  toast.error(t("paymentSaveFailed"), {
+    description: t("paymentSaveFailedDetail").replace(
+      "{details}",
+      summarizePersistenceError(err),
+    ),
+  });
+}
+
+/**
  * The store write contract: snapshot → optimistic `set` → await the doc
  * write → revert + toast on failure. Every persistence write goes through
  * here so a Supabase rejection can never silently leave the local store
@@ -925,9 +959,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
       }
     } catch (err) {
-      console.error("[ennajd] syncPayments write failed:", err);
+      logPaymentWriteFailure("syncPayments", err);
       set({ payments: previousPayments, students: previousStudents });
-      toast.error(t("paymentSaveFailed"));
     }
   },
 
@@ -1022,11 +1055,15 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     }
 
     try {
-      if (result.toUpsert.length > 0) {
-        await upsertPaymentsBatchDoc(result.toUpsert);
-      }
+      // DELETE BEFORE UPSERT: a re-anchor can move a row's dueDate onto a
+      // date a stale row still occupies. Deleting first keeps the
+      // unique(student_id, subject, due_date) constraint satisfiable —
+      // upserting first would trip it and the whole batch would roll back.
       if (result.toDelete.length > 0) {
         await deletePaymentsBatchDoc(result.toDelete);
+      }
+      if (result.toUpsert.length > 0) {
+        await upsertPaymentsBatchDoc(result.toUpsert);
       }
       if (nextAdvanceBalance !== undefined) {
         await updateStudentAdvanceBalanceDoc(studentId, nextAdvanceBalance);
@@ -1034,7 +1071,12 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     } catch (err) {
       console.error("[ennajd] reactive ledger recalc write failed:", err);
       set({ payments: previousPayments, students: previousStudents });
-      toast.warning(t("ledgerRecalcFailed"));
+      toast.warning(t("ledgerRecalcFailed"), {
+        description: t("paymentSaveFailedDetail").replace(
+          "{details}",
+          summarizePersistenceError(err),
+        ),
+      });
       return;
     }
 
@@ -1435,21 +1477,46 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
       }
     }
 
-    const nextPayments = [...keptPayments, ...rebuilt];
+    // Guard the DB constraints before writing:
+    //  - unique(student_id, subject, due_date): two enrollments of the same
+    //    subject (e.g. different tracks) can generate rows sharing the
+    //    natural key. Collapse to one row per key, keeping the most settled.
+    //  - check (amount_due > 0): a zero/negative amount (free join month,
+    //    zero price) must never be inserted.
+    const deduped = new Map<string, Payment>();
+    for (const payment of rebuilt) {
+      if (payment.amountDue <= 0) continue;
+      const key = `${payment.studentId}__${payment.subject}__${payment.dueDate}`;
+      const current = deduped.get(key);
+      if (!current) {
+        deduped.set(key, payment);
+      } else {
+        const keep =
+          (payment.isPaid ? 1 : 0) - (current.isPaid ? 1 : 0) !== 0
+            ? payment.isPaid
+            : (payment.amountPaid ?? 0) >= (current.amountPaid ?? 0);
+        deduped.set(key, keep ? payment : current);
+      }
+    }
+    const rebuiltRows = [...deduped.values()];
+
+    const nextPayments = [...keptPayments, ...rebuiltRows];
     set({ payments: nextPayments });
 
     try {
+      // DELETE BEFORE UPSERT: the rebuilt rows reuse the natural key of the
+      // deleted ones, so the Rule A rows must be gone before the inserts
+      // land or the unique constraint rejects the batch.
       if (deletedRuleA.length > 0) {
         await deletePaymentsBatchDoc(deletedRuleA.map((p) => p.id));
       }
-      if (rebuilt.length > 0) {
-        await upsertPaymentsBatchDoc(rebuilt);
+      if (rebuiltRows.length > 0) {
+        await upsertPaymentsBatchDoc(rebuiltRows);
       }
       return true;
     } catch (err) {
-      console.error("[ennajd] regeneratePaymentLedger failed:", err);
+      logPaymentWriteFailure("regeneratePaymentLedger", err);
       set({ payments: previousPayments, students: previousStudents });
-      toast.error(t("paymentSaveFailed"));
       return false;
     }
   },

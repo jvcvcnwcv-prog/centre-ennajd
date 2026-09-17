@@ -1105,7 +1105,7 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
       track: options.track,
       groupType: options.groupType,
     });
-    const matrix = buildPaymentMatrix(roster, options.payments, options.subject, months, options.basePrice, options.sessions);
+    const matrix = buildPaymentMatrix(roster, options.payments, options.subject, months, options.basePrice, options.sessions, options.attendanceRecords, todayKey);
     const yearLabel = `${months[0].year}-${months[months.length - 1].year}`;
     const chunks = chunkRows(matrix.rows, REPORT_ROWS_PER_PAGE);
     const pageChunks: typeof chunks = chunks.length > 0 ? chunks : [[]];
@@ -1288,9 +1288,6 @@ function StudentReceiptDocument({ options }: { options: RenderStudentReceiptOpti
               <Text style={receiptStyles.headerCellText}>{t("amountDue")}</Text>
             </View>
             <View style={receiptStyles.receiptHeaderCell}>
-              <Text style={receiptStyles.headerCellText}>{t("halfMonth")}</Text>
-            </View>
-            <View style={receiptStyles.receiptHeaderCell}>
               <Text style={receiptStyles.headerCellText}>{t("paid")} / {t("unpaid")}</Text>
             </View>
             <View style={receiptStyles.receiptHeaderCell}>
@@ -1300,7 +1297,7 @@ function StudentReceiptDocument({ options }: { options: RenderStudentReceiptOpti
           <View style={receiptStyles.headerAccentStrip} />
           {installments.length === 0 ? (
             <View style={[receiptStyles.row, rtl ? { flexDirection: "row-reverse" } : {}]}>
-              <View style={[receiptStyles.receiptBodyCell, { flex: 5 }]}>
+              <View style={[receiptStyles.receiptBodyCell, { flex: 4 }]}>
                 <Text style={receiptStyles.markMuted}>{t("noPaymentsDue")}</Text>
               </View>
             </View>
@@ -1319,9 +1316,6 @@ function StudentReceiptDocument({ options }: { options: RenderStudentReceiptOpti
                 </View>
                 <View style={receiptStyles.receiptBodyCell}>
                   <Text style={receiptStyles.receiptCellText}>{payment.amountDue} MAD</Text>
-                </View>
-                <View style={receiptStyles.receiptBodyCell}>
-                  <Text style={receiptStyles.receiptCellText}>{payment.isHalfMonth ? "1⁄2" : "—"}</Text>
                 </View>
                 <View style={receiptStyles.receiptBodyCell}>
                   <Text

@@ -212,12 +212,20 @@ export function StudentFormSheet({
       };
   
       if (student) {
-        updateStudent(student.id, payload);
+        // Await the write: payments.student_id is an FK to this row, and the
+        // sheet must stay open when the write is rejected.
+        const ok = await updateStudent(student.id, payload);
+        if (!ok) return;
+        toast.success(t("studentSaved"));
+        onOpenChange(false);
       } else {
-        const newStudent = addStudent(payload);
+        // Await the student row BEFORE distributing tuition — payments.student_id
+        // is an FK to it, so the insert must land first.
+        const newStudent = await addStudent(payload);
+        if (!newStudent) return;
         // After student creation, distribute any tuition Paid across generated installments.
         // Only in create mode (!student) and when there are enrollments.
-        if (!student && form.enrollments.length > 0 && tuitionTotal > 0 && tuitionPaid > 0) {
+        if (form.enrollments.length > 0 && tuitionTotal > 0 && tuitionPaid > 0) {
           try {
             await applyInitialTuitionPayment(newStudent.id, tuitionPaid, new Date());
             toast.success(t("initialTuitionPaymentRecorded"));

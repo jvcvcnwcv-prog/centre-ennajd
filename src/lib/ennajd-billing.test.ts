@@ -2,21 +2,40 @@
 // Run with: npx vitest run src/lib/ennajd-billing.test.ts
 
 import { describe, it, expect } from "vitest";
-import { applyCreditWaterfall, generateRuleASchedule, isPaymentFullyPaid } from "./ennajd-billing";
-import type { Payment, Subject } from "../types/ennajd";
+import {
+  applyCreditWaterfall,
+  formatMonthKey,
+  generateRuleASchedule,
+  getPaymentRuleFor,
+  isPaymentFullyPaid,
+  isProratedSubject,
+} from "./ennajd-billing";
+import type {
+  GroupType,
+  Level,
+  Payment,
+  Session,
+  Student,
+  Subject,
+  SubjectEnrollment,
+  Track,
+} from "../types/ennajd";
 
 // Helper to build a DeliveredDatesContext for testing generateRuleASchedule.
 // `hasSession=true` means standard sessions on the given weekdays; the count
-// function counts how many of those fall in a date range.
+// function counts how many of those fall in a date range. `gapMonthKeys`
+// marks Rule D gap months (zero standard scheduled occurrences).
 function makeCtx(opts: {
   hasSession?: boolean;
   scheduledDaysOfWeek?: number[];
   fallbackDayOfWeek?: number;
+  gapMonthKeys?: ReadonlySet<string>;
 }) {
   return {
     hasSession: opts.hasSession ?? true,
     scheduledDaysOfWeek: opts.scheduledDaysOfWeek ?? [],
     fallbackDayOfWeek: opts.fallbackDayOfWeek ?? 1,
+    gapMonthKeys: opts.gapMonthKeys ?? new Set<string>(),
   };
 }
 
@@ -50,6 +69,53 @@ function makePayment(
 }
 
 const STUDENT_ID = "student-1";
+
+// --- Proration test fixtures (Rules A-D + 2BAC Small exemption) ---
+
+/** Noontime ISO so local-calendar fields are stable in any timezone. */
+const NOON = "T12:00:00.000Z";
+
+function makeStudent(opts: {
+  id?: string;
+  level?: Level;
+  track?: Track | null;
+  enrollments: SubjectEnrollment[];
+  advanceBalance?: number;
+}): Student {
+  return {
+    id: opts.id ?? STUDENT_ID,
+    firstName: "Test",
+    lastName: "Student",
+    whatsappPhone: "",
+    parentPhone: "",
+    level: opts.level ?? "T.C",
+    track: opts.track ?? null,
+    enrollments: opts.enrollments,
+    createdAt: "2025-01-01T00:00:00.000Z",
+    advanceBalance: opts.advanceBalance,
+  };
+}
+
+function makeRecurringSession(
+  subject: Subject,
+  level: Level,
+  track: Track | null,
+  groupType: GroupType | null,
+  dayOfWeek: number,
+): Session {
+  return {
+    id: `session-${subject}-${level}-${dayOfWeek}`,
+    subject,
+    level,
+    track,
+    groupType,
+    dayOfWeek,
+    startTime: "16:00",
+    endTime: "18:00",
+    kind: "recurring",
+    date: null,
+  };
+}
 
 describe("applyCreditWaterfall", () => {
   it("distributes credit across current + future installments (surplus rolls forward)", () => {
@@ -288,5 +354,231 @@ describe("generateRuleASchedule — Rule A single-session skip", () => {
     const feb1 = schedule.find((s) => s.dueDate.getTime() === new Date(2025, 1, 1).getTime());
     expect(feb1).toBeDefined();
     expect(feb1!.autoPaid).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rule D — gap months in generateRuleASchedule
+// ---------------------------------------------------------------------------
+
+describe("generateRuleASchedule — Rule D gap months", () => {
+  it("emits NO installment for a month with zero standard scheduled occurrences", () => {
+    // Combo not scheduled at all → every month has 0 occurrences → no debt.
+    const ctx = makeCtx({
+      hasSession: true,
+      scheduledDaysOfWeek: [],
+      fallbackDayOfWeek: 3,
+    });
+    const schedule = generateRuleASchedule(
+      new Date(2025, 0, 8),
+      new Date(2025, 4, 15),
+      ctx,
+    );
+    expect(schedule).toHaveLength(0);
+  });
+
+  it("skips an explicitly-marked gap month and resumes the next month", () => {
+    // Wednesday combo; March 2025 is a term break (gap month). Joining Jan 8
+    // 2025 (Wednesday) with 4/5 sessions remaining → custom tier (M2 ratio
+    // 4/5 on Feb 1), then full months from March onward — except March,
+    // which emits nothing.
+    const ctx = makeCtx({
+      hasSession: true,
+      scheduledDaysOfWeek: [3], // Wednesday
+      fallbackDayOfWeek: 3,
+      gapMonthKeys: new Set(["2025-03"]),
+    });
+    const schedule = generateRuleASchedule(
+      new Date(2025, 0, 8),
+      new Date(2025, 4, 15),
+      ctx,
+    );
+    const dueMonthKeys = schedule.map((s) => formatMonthKey(s.dueDate));
+
+    // March is skipped entirely — no installment, no debt.
+    expect(dueMonthKeys).not.toContain("2025-03");
+    // Surrounding months are still emitted.
+    expect(dueMonthKeys).toContain("2025-01");
+    expect(dueMonthKeys).toContain("2025-02");
+    expect(dueMonthKeys).toContain("2025-04");
+    expect(dueMonthKeys).toContain("2025-05");
+  });
+
+  it("skips gap months in the single-session-skip branch too", () => {
+    // 1 remaining session in the join month (Rule A skip of month 1), with
+    // April marked as a gap month.
+    const ctx = makeCtx({
+      hasSession: true,
+      scheduledDaysOfWeek: [3],
+      fallbackDayOfWeek: 3,
+      gapMonthKeys: new Set(["2025-04"]),
+    });
+    const schedule = generateRuleASchedule(
+      new Date(2025, 0, 29), // last Wednesday of Jan → 1 remaining
+      new Date(2025, 4, 15),
+      ctx,
+    );
+    const dueMonthKeys = schedule.map((s) => formatMonthKey(s.dueDate));
+    expect(dueMonthKeys).not.toContain("2025-04");
+    expect(dueMonthKeys).toContain("2025-02");
+    expect(dueMonthKeys).toContain("2025-03");
+    expect(dueMonthKeys).toContain("2025-05");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Waterfall Rules A-D + 2BAC Small exemption
+// ---------------------------------------------------------------------------
+
+describe("applyCreditWaterfall — Rule A join-month-only skip", () => {
+  it("skips the join-month installment but credits a LATER month (scope fix)", () => {
+    // 1x/week Wednesday combo; student joins Jan 29 2025 (Wednesday) →
+    // exactly 1 standard session remains in the join month → Rule A skip,
+    // scoped to "2025-01" only.
+    const student = makeStudent({
+      level: "T.C",
+      enrollments: [
+        { subject: "Math", track: null, groupType: "Large", enrolledAt: `2025-01-29${NOON}` },
+      ],
+    });
+    const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-29", 1000), // join month
+      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 1000), // later month
+      makePayment("p3", STUDENT_ID, "Math", "2025-03-01", 1000), // later month
+    ];
+
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "Math", 1500, "2025-02-15", NOW, {
+      student,
+      sessions,
+      prices: [],
+    });
+
+    // Join-month installment is untouched (Rule A skip).
+    expect(result.updated.find((p) => p.id === "p1")).toBeUndefined();
+    // Later months are still creditable (the scope fix): Feb cleared, Mar partial.
+    expect(result.updated.find((p) => p.id === "p2")?.amountPaid).toBe(1000);
+    expect(result.updated.find((p) => p.id === "p3")?.amountPaid).toBe(500);
+    expect(result.remaining).toBe(0);
+  });
+});
+
+describe("applyCreditWaterfall — Rule B partial month (once-per-subject budget)", () => {
+  it("caps current-month credit at round(credit * ratio) and rolls the surplus forward", () => {
+    // Join Jan 8 2025 (Wednesday) with 4 of 5 Wednesday sessions remaining →
+    // ratio 4/5. A 1000 MAD credit must put round(1000 * 0.8) = 800 on the
+    // current month and roll the 200 surplus to the next installment.
+    const student = makeStudent({
+      level: "T.C",
+      enrollments: [
+        { subject: "Math", track: null, groupType: "Large", enrolledAt: `2025-01-08${NOON}` },
+      ],
+    });
+    const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-08", 1000), // current month
+      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 1000), // future
+      makePayment("p3", STUDENT_ID, "Math", "2025-03-01", 1000), // future
+    ];
+
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "Math", 1000, "2025-01-20", NOW, {
+      student,
+      sessions,
+      prices: [],
+    });
+
+    const p1 = result.updated.find((p) => p.id === "p1");
+    const p2 = result.updated.find((p) => p.id === "p2");
+    expect(p1?.amountPaid).toBe(800); // budget-capped, NOT the full 1000
+    expect(isPaymentFullyPaid(p1!)).toBe(false);
+    expect(p2?.amountPaid).toBe(200); // surplus rolled forward
+    expect(result.updated.find((p) => p.id === "p3")).toBeUndefined(); // nothing left
+    expect(result.remaining).toBe(0);
+    expect(result.currentMonthCredit).toBe(800);
+    expect(result.futureMonthCredit).toBe(200);
+  });
+});
+
+describe("applyCreditWaterfall — Rule C full month", () => {
+  it("applies 100% of credit to the current month when remaining === total", () => {
+    // Joined Jan 1 2025 (first Wednesday) → all 5 sessions remain → ratio 1.
+    const student = makeStudent({
+      level: "T.C",
+      enrollments: [
+        { subject: "Math", track: null, groupType: "Large", enrolledAt: `2025-01-01${NOON}` },
+      ],
+    });
+    const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 500), // current month
+      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 500), // future
+    ];
+
+    const result = applyCreditWaterfall(payments, STUDENT_ID, "Math", 500, "2025-01-20", NOW, {
+      student,
+      sessions,
+      prices: [],
+    });
+
+    const p1 = result.updated.find((p) => p.id === "p1");
+    expect(p1?.amountPaid).toBe(500);
+    expect(isPaymentFullyPaid(p1!)).toBe(true);
+    expect(result.updated.find((p) => p.id === "p2")).toBeUndefined();
+    expect(result.remaining).toBe(0);
+    expect(result.currentMonthCredit).toBe(500);
+    expect(result.futureMonthCredit).toBe(0);
+  });
+});
+
+describe("applyCreditWaterfall — 2BAC Small (P.G) exemption", () => {
+  const SMALL_2BAC_COMBOS: Array<{ subject: Subject; track: Track }> = [
+    { subject: "Math", track: "s.x" },
+    { subject: "PC", track: "s.x" },
+    { subject: "SVT", track: "s.x" },
+  ];
+
+  for (const { subject, track } of SMALL_2BAC_COMBOS) {
+    it(`falls back to plain gap-filling for 2Bac ${track} Small ${subject} (no proration)`, () => {
+      expect(getPaymentRuleFor("2Bac", subject, "Small", track)).toBe("B");
+
+      const student = makeStudent({
+        level: "2Bac",
+        track,
+        enrollments: [
+          { subject, track, groupType: "Small", enrolledAt: `2025-01-29${NOON}` },
+        ],
+      });
+      expect(isProratedSubject(student, subject)).toBe(false);
+
+      const sessions = [makeRecurringSession(subject, "2Bac", track, "Small", 3)];
+      const payments: Payment[] = [
+        makePayment("p1", STUDENT_ID, subject, "2025-01-29", 300), // current month
+        makePayment("p2", STUDENT_ID, subject, "2025-02-01", 300), // future
+      ];
+
+      const result = applyCreditWaterfall(payments, STUDENT_ID, subject, 400, "2025-02-15", NOW, {
+        student,
+        sessions,
+        prices: [],
+      });
+
+      // Plain gap-filling: the current month is NOT capped by any ratio — it
+      // is cleared outright and the surplus lands on the next installment.
+      expect(result.updated.find((p) => p.id === "p1")?.amountPaid).toBe(300);
+      expect(result.updated.find((p) => p.id === "p2")?.amountPaid).toBe(100);
+      expect(result.remaining).toBe(0);
+    });
+  }
+
+  it("a non-exempt 2Bac combo still prorates (s.m is not P.G)", () => {
+    const student = makeStudent({
+      level: "2Bac",
+      track: "s.m",
+      enrollments: [
+        { subject: "Math", track: "s.m", groupType: "Small", enrolledAt: `2025-01-29${NOON}` },
+      ],
+    });
+    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.m")).toBe("A");
+    expect(isProratedSubject(student, "Math")).toBe(true);
   });
 });

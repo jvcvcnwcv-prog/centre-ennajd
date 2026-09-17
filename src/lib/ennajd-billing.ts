@@ -115,6 +115,13 @@ export interface DeliveredDatesContext {
   hasSession: boolean;
   scheduledDaysOfWeek: number[]; // unique dayOfWeek values for standard sessions of this combo
   fallbackDayOfWeek: number; // enrolledAt's day-of-week; only used when hasSession is false
+  /** "YYYY-MM" months where this combo has ZERO standard scheduled occurrences
+   *  (Rule D — gap months). A recurring weekly slot lands on every weekday of
+   *  every calendar month, so this set is empty for a normal timetable; it is
+   *  populated for combos that were only ever scheduled via dated (one_off)
+   *  sessions, and callers/tests may mark extra gap months (term breaks,
+   *  timetable added mid-year). No installment is emitted for a gap month. */
+  gapMonthKeys: ReadonlySet<string>;
 }
 
 export function buildDeliveredDatesContext(
@@ -136,6 +143,15 @@ export function buildDeliveredDatesContext(
     hasSession: matchingStandard.length > 0,
     scheduledDaysOfWeek: [...new Set(matchingStandard.map((s) => s.dayOfWeek))],
     fallbackDayOfWeek: enrolledAt.getDay(),
+    // Rule D — gap months: months where the combo has zero STANDARD
+    // scheduled occurrences. A recurring weekly slot covers every calendar
+    // month, so only dated (one_off) standard sessions can produce real
+    // gaps here; the set stays empty for a normal recurring timetable.
+    gapMonthKeys: new Set(
+      matchingStandard
+        .filter((s) => getSessionKind(s) === "one_off" && s.date)
+        .map((s) => s.date!.slice(0, 7)),
+    ),
   };
 }
 
@@ -160,11 +176,32 @@ function countOccurrencesInRange(ctx: DeliveredDatesContext, from: Date, to: Dat
 }
 
 /**
+ * Rule D — gap month: the combo has ZERO standard scheduled occurrences in
+ * the calendar month containing `date`. Deterministic (purely schedule-based;
+ * attendance is never consulted, consistent with Rule 3) and can't be gamed:
+ * with a recurring weekly timetable every month has ≥1 occurrence, so a gap
+ * only arises when the combo isn't scheduled that month at all (timetable
+ * added mid-year, term breaks, combo not yet scheduled, or an explicit
+ * `gapMonthKeys` entry). A gap month emits NO installment → no debt accumulates
+ * and the Payments/Reports UI renders "-".
+ */
+function isGapMonth(ctx: DeliveredDatesContext, date: Date): boolean {
+  const year = date.getFullYear();
+  const monthIndex0 = date.getMonth();
+  const monthStart = new Date(year, monthIndex0, 1);
+  const monthEnd = new Date(year, monthIndex0, daysInMonth(year, monthIndex0));
+  if (countOccurrencesInRange(ctx, monthStart, monthEnd) === 0) return true;
+  return ctx.gapMonthKeys.has(formatMonthKey(date));
+}
+
+/**
  * Rule A schedule (every combo except 2Bac PC-Small):
  * Dynamic per subject/level — totalMonthlySessions and monthlyFee are not hardcoded.
  * Extra sessions excluded 100%. Attendance does not affect billing.
  *
- * - Month 1 always charges the full fee upfront, due on the join date itself.
+ * - Month 1 charges the full fee upfront, due on the join date itself (Rule D:
+ *   skipped entirely when the combo has zero standard scheduled occurrences in
+ *   the join month — no sessions, no charge, no debt).
  * - Month 2 (next calendar month) is tiered based on STANDARD sessions remaining in join month:
  *   - Exactly half (e.g. 2/4 or 4/8) → half-month: HALF fee due on the 15th of next month to align cycle to 1st of M3.
  *     Checked FIRST so 2/4 is half, not late-bonus.
@@ -172,6 +209,10 @@ function countOccurrencesInRange(ctx: DeliveredDatesContext, from: Date, to: Dat
  *   - Otherwise (3,5,6,7…) → custom prorated: perSessionRate = monthlyFee / totalMonthlySessions,
  *     M1 cost = remaining * perSessionRate, excess credited → M2 ratio = remaining/total on 1st.
  * - Every month from the month after the tier adjustment onward is plain full-price on the 1st.
+ * - Rule D (gap months): any month with ZERO standard scheduled occurrences of
+ *   the combo emits NO installment at all (term breaks, timetable added
+ *   mid-year, combo not yet scheduled) — no debt accumulates and the UI
+ *   renders "-".
  */
 export function generateRuleASchedule(
   enrolledAt: Date,
@@ -196,26 +237,33 @@ export function generateRuleASchedule(
   // Apply 100% of tuition to next month's installment (autoPaid: true).
   if (remaining === 1) {
     if (nextMonthDue > asOf) return [];
-    const results: ScheduledInstallment[] = [
-      {
+    const results: ScheduledInstallment[] = [];
+    // Rule D: skip months with zero standard scheduled occurrences.
+    if (!isGapMonth(ctx, nextMonthDue)) {
+      results.push({
         dueDate: nextMonthDue,
         isHalfMonth: false,
         amountRatio: 1,
         autoPaid: true,
-      },
-    ];
+      });
+    }
     let next = addMonthsClamped(nextMonthDue, 1);
     while (next <= asOf) {
-      results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+      if (!isGapMonth(ctx, next)) {
+        results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+      }
       next = addMonthsClamped(next, 1);
     }
     return results;
   }
 
   // Default: Month 1 full fee upfront on the join date.
-  const results: ScheduledInstallment[] = [
-    { dueDate: enrolledAt, isHalfMonth: false, amountRatio: 1, autoPaid: false },
-  ];
+  // Rule D: emit nothing for the join month when the combo has zero standard
+  // scheduled occurrences in it (no sessions → no charge).
+  const results: ScheduledInstallment[] = [];
+  if (!isGapMonth(ctx, enrolledAt)) {
+    results.push({ dueDate: enrolledAt, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+  }
 
   if (nextMonthDue > asOf) return results;
 
@@ -225,7 +273,7 @@ export function generateRuleASchedule(
   // Tier 2 — Half-Month Join (exactly half) takes precedence over Late when overlapping (e.g. 2/4)
   if (isExactlyHalf) {
     const midNextMonth = new Date(nextMonthDue.getFullYear(), nextMonthDue.getMonth(), MID_MONTH_HALF_DAY);
-    if (midNextMonth <= asOf) {
+    if (midNextMonth <= asOf && !isGapMonth(ctx, midNextMonth)) {
       results.push({
         dueDate: midNextMonth, // 15th to align cycle to 1st of M3
         isHalfMonth: true,
@@ -236,7 +284,9 @@ export function generateRuleASchedule(
     // From M3 (monthStart+2) onwards, billing shifts permanently to 1st of every month at FULL fee
     let next = addMonthsClamped(monthStart, 2);
     while (next <= asOf) {
-      results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+      if (!isGapMonth(ctx, next)) {
+        results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+      }
       next = addMonthsClamped(next, 1);
     }
     return results;
@@ -244,15 +294,19 @@ export function generateRuleASchedule(
 
   // Tier 1 — Late-Month Join (<=2 standard sessions remaining) → FREE bonus
   if (remaining <= FREE_BONUS_MAX_SESSIONS) {
-    results.push({
-      dueDate: nextMonthDue,
-      isHalfMonth: false,
-      amountRatio: 1,
-      autoPaid: true, // upfront full fee credited 100% toward next month's invoice; the <=2 sessions are FREE
-    });
+    if (!isGapMonth(ctx, nextMonthDue)) {
+      results.push({
+        dueDate: nextMonthDue,
+        isHalfMonth: false,
+        amountRatio: 1,
+        autoPaid: true, // upfront full fee credited 100% toward next month's invoice; the <=2 sessions are FREE
+      });
+    }
     let next = addMonthsClamped(nextMonthDue, 1);
     while (next <= asOf) {
-      results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+      if (!isGapMonth(ctx, next)) {
+        results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+      }
       next = addMonthsClamped(next, 1);
     }
     return results;
@@ -263,16 +317,20 @@ export function generateRuleASchedule(
   // join month cost = sessionsRemaining * perSessionRate
   // excess upfront credited toward next month => M2 ratio = remaining/total
   const ratio = total > 0 ? remaining / total : 1;
-  results.push({
-    dueDate: nextMonthDue,
-    isHalfMonth: false,
-    amountRatio: ratio,
-    autoPaid: false,
-  });
+  if (!isGapMonth(ctx, nextMonthDue)) {
+    results.push({
+      dueDate: nextMonthDue,
+      isHalfMonth: false,
+      amountRatio: ratio,
+      autoPaid: false,
+    });
+  }
 
   let next = addMonthsClamped(nextMonthDue, 1);
   while (next <= asOf) {
-    results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+    if (!isGapMonth(ctx, next)) {
+      results.push({ dueDate: next, isHalfMonth: false, amountRatio: 1, autoPaid: false });
+    }
     next = addMonthsClamped(next, 1);
   }
   return results;
@@ -441,9 +499,15 @@ export interface SubjectProration {
   /** Fraction of credit that belongs on the current month (remaining/total).
    *  Rule C (full month) = 1.0; Rule B (partial) < 1.0; Rule A skip = 0. */
   ratio: number;
-  /** Rule A (Single Session Skip): only 1 standard session remains -> skip
-   *  current-month installments entirely, direct 100% to future months. */
+  /** Rule A (Single Session Skip): only 1 standard session remains in the
+   *  join month -> skip current-month installments entirely, direct
+   *  100% to future months. Scoped to the join month only via
+   *  `joinMonthKey` — later months are always creditable. */
   skipCurrent: boolean;
+  /** "YYYY-MM" of the student's enrollment join date for this subject.
+   *  `skipCurrent` only applies to installments whose dueDate falls in this
+   *  calendar month; every other month owes its full installment. */
+  joinMonthKey: string;
 }
 
 /**
@@ -478,11 +542,15 @@ function computeSubjectProration(
 
   if (remainingSessions === null) return null;
 
+  // joinMonthKey = the calendar month the student enrolled in this subject.
+  // Rule A's skipCurrent only applies to installments in THIS month.
+  const joinMonthKey = formatMonthKey(from);
+
   // --- Rule A: Single Session Skip ---
-  // Only 1 standard session remains in the current month -> skip current-month
+  // Only 1 standard session remains in the join month -> skip current-month
   // installments entirely, direct 100% to future months.
   if (remainingSessions === 1) {
-    return { ratio: 0, skipCurrent: true };
+    return { ratio: 0, skipCurrent: true, joinMonthKey };
   }
 
   // --- Rules B (Partial) & C (Full Month) ---
@@ -514,7 +582,7 @@ function computeSubjectProration(
   const ratio = total > 0 ? remainingSessions / total : 1;
   // Rule C: remaining == total -> ratio = 1.0 -> 100% current month.
   // Rule B: remaining < total -> ratio < 1.0 -> prorated.
-  return { ratio, skipCurrent: false };
+  return { ratio, skipCurrent: false, joinMonthKey };
 }
 
 export interface CreditWaterfallResult {
@@ -636,6 +704,22 @@ export function applyCreditWaterfall(
   let currentMonthCredit = 0;
   let futureMonthCredit = 0;
 
+  // Per-subject current-month budget (Rule B/C): the total credit earmarked
+  // for this subject's current-month installments, computed ONCE as
+  // Math.round(credit * ratio). Tracked via budgetSpent so repeated
+  // Math.round per row never overshoots — unspent budget stays in `remaining`
+  // and naturally flows to the next due installment / advanceBalance.
+  const budgetBySubject = new Map<Subject, number>();
+  const budgetSpentBySubject = new Map<Subject, number>();
+  if (subjectProration) {
+    for (const [subj, proration] of subjectProration) {
+      if (proration.ratio > 0) {
+        budgetBySubject.set(subj, Math.round(credit * proration.ratio));
+        budgetSpentBySubject.set(subj, 0);
+      }
+    }
+  }
+
   for (const payment of eligible) {
     if (remaining <= 0) break;
 
@@ -644,8 +728,13 @@ export function applyCreditWaterfall(
     // Look up this payment's own subject proration profile (Rules A-D).
     const proration = subjectProration?.get(payment.subject);
 
-    // Rule A skip: leave current-month installments untouched.
-    if (proration?.skipCurrent && isCurrentMonth) {
+    // Rule A skip: only for installments in the JOIN month (scoped fix).
+    // Later months always remain creditable.
+    if (
+      proration?.skipCurrent &&
+      isCurrentMonth &&
+      payment.dueDate.slice(0, 7) === proration.joinMonthKey
+    ) {
       continue;
     }
 
@@ -656,9 +745,14 @@ export function applyCreditWaterfall(
     let apply: number;
 
     if (proration && isCurrentMonth && proration.ratio > 0) {
-      // Rule B / C: apply prorated proportion of credit to current month.
-      const proratedCredit = Math.round(credit * proration.ratio);
-      apply = Math.min(gap, proratedCredit, remaining);
+      // Rule B / C: apply prorated proportion of credit to current month,
+      // bounded by the once-per-subject budget (not a fresh credit*ratio
+      // per row, which could overshoot). Unspent budget stays in
+      // `remaining` and flows to the next installment.
+      const spent = budgetSpentBySubject.get(payment.subject) ?? 0;
+      const budget = budgetBySubject.get(payment.subject) ?? 0;
+      apply = Math.min(gap, budget - spent, remaining);
+      budgetSpentBySubject.set(payment.subject, spent + apply);
     } else {
       apply = Math.min(gap, remaining);
     }

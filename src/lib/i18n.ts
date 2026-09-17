@@ -381,6 +381,14 @@ const dictionary = {
     paymentSaveFailed: "Échec de l'enregistrement du paiement",
     paymentSaveFailedHint:
       "Le paiement n'a pas pu être enregistré. Vos modifications locales ont été annulées — réessayez.",
+    sessionSaveFailed: "Échec de l'enregistrement de la séance",
+    attendanceSaveFailed: "Échec de l'enregistrement de la présence",
+    studentSaveFailed: "Échec de l'enregistrement de l'élève",
+    studentDeleteFailed: "Échec de la suppression de l'élève",
+    sessionDeleteFailed: "Échec de la suppression de la séance",
+    priceSaveFailed: "Échec de l'enregistrement du tarif",
+    messageSaveFailed: "Échec de l'enregistrement du message",
+    saveFailed: "Échec de l'enregistrement",
     advanceCredit: "Crédit d'avance",
     advanceApplied: "Crédit d'avance appliqué",
     advanceCreditCarryOver:
@@ -753,6 +761,14 @@ const dictionary = {
     paymentSaveFailed: "فشل حفظ الدفع",
     paymentSaveFailedHint:
       "تعذر حفظ الدفع. تم إلغاء التغييرات المحلية — حاول مرة أخرى.",
+    sessionSaveFailed: "فشل حفظ الحصة",
+    attendanceSaveFailed: "فشل حفظ الحضور",
+    studentSaveFailed: "فشل حفظ الطالب",
+    studentDeleteFailed: "فشل حذف الطالب",
+    sessionDeleteFailed: "فشل حذف الحصة",
+    priceSaveFailed: "فشل حفظ السعر",
+    messageSaveFailed: "فشل حفظ الرسالة",
+    saveFailed: "فشل الحفظ",
     advanceCredit: "رصيد مقدماً",
     advanceApplied: "تم تطبيق الرصيد المتقدّن",
     advanceCreditCarryOver:
@@ -763,6 +779,15 @@ const dictionary = {
 } satisfies Record<LangCode, Record<string, string>>;
 
 export type DictKey = keyof typeof dictionary.fr;
+
+/**
+ * Non-reactive translator for module-level code (the Zustand store,
+ * services) that cannot call the `useI18n` hook. Reads the current language
+ * synchronously from the persisted language store.
+ */
+export function translate(key: DictKey): string {
+  return dictionary[useLangStore.getState().lang][key];
+}
 
 interface LangState {
   lang: LangCode;

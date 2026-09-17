@@ -131,7 +131,7 @@ export function SessionFormDialog({
     const smallAllowed =
       !combined && canSubjectBeSmallGroup(form.level, form.track, form.subject);
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (trackRequired && !combined && !form.track) {
       toast.error(t("invalidCombination"));
@@ -168,13 +168,16 @@ export function SessionFormDialog({
       date: form.kind === "one_off" ? form.date : null,
     };
 
-    if (session) {
-      updateSession(session.id, payload);
-      toast.success(t("sessionSaved"));
-    } else {
-      addSession(payload);
-      toast.success(t("sessionSaved"));
-    }
+    // Await the DB write: the success toast + dialog close only fire once the
+    // row is confirmed. On failure the store reverts its optimistic state and
+    // fires the error toast itself — the dialog stays open, so a rejected
+    // insert is never indistinguishable from a success.
+    const saved = session
+      ? await updateSession(session.id, payload)
+      : await addSession(payload);
+    if (!saved) return;
+
+    toast.success(t("sessionSaved"));
     onOpenChange(false);
   }
 

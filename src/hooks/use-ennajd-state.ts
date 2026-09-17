@@ -30,6 +30,7 @@ import {
   shouldAutoMarkAbsent,
   shouldAutoMarkAbsentOneOff,
 } from "@/lib/ennajd-taxonomy";
+import { translate as t, type DictKey } from "@/lib/i18n";
 import {
   addSessionDoc,
   addStudentDoc,
@@ -85,15 +86,15 @@ interface EnnajdState {
 
   addStudent: (
     student: Omit<Student, "id" | "createdAt">,
-  ) => Student;
-  updateStudent: (id: string, patch: Partial<Omit<Student, "id">>) => void;
-  deleteStudent: (id: string) => void;
+  ) => Promise<Student | null>;
+  updateStudent: (id: string, patch: Partial<Omit<Student, "id">>) => Promise<boolean>;
+  deleteStudent: (id: string) => Promise<boolean>;
 
-  addSession: (session: Omit<Session, "id">) => Session;
-  updateSession: (id: string, patch: Partial<Omit<Session, "id">>) => void;
-  deleteSession: (id: string) => void;
+  addSession: (session: Omit<Session, "id">) => Promise<Session | null>;
+  updateSession: (id: string, patch: Partial<Omit<Session, "id">>) => Promise<boolean>;
+  deleteSession: (id: string) => Promise<boolean>;
 
-  setPrice: (entry: Omit<PriceEntry, "id">) => void;
+  setPrice: (entry: Omit<PriceEntry, "id">) => Promise<boolean>;
   getBasePrice: (
     level: Level,
     subject: Subject,
@@ -108,12 +109,12 @@ interface EnnajdState {
     date: string,
     status: AttendanceStatus,
     opts?: { isGuest?: boolean; isManualOverride?: boolean },
-  ) => void;
+  ) => Promise<boolean>;
   getAttendanceFor: (sessionId: string, date: string) => AttendanceRecord[];
-  runAutoAbsenceSweep: (now: Date) => void;
-  sweepExpiredOneOffSessions: (now: Date) => number;
+  runAutoAbsenceSweep: (now: Date) => Promise<void>;
+  sweepExpiredOneOffSessions: (now: Date) => Promise<number>;
 
-  syncPayments: (now: Date) => void;
+  syncPayments: (now: Date) => Promise<void>;
   setPaymentPaid: (paymentId: string, isPaid: boolean) => Promise<void>;
   recordPartialPayment: (
     studentId: string,
@@ -151,9 +152,9 @@ interface EnnajdState {
 
   addMessage: (
     message: Omit<LevelMessage, "id" | "createdAt" | "updatedAt">,
-  ) => LevelMessage;
-  updateMessage: (id: string, patch: Partial<Omit<LevelMessage, "id">>) => void;
-  deleteMessage: (id: string) => void;
+  ) => Promise<LevelMessage | null>;
+  updateMessage: (id: string, patch: Partial<Omit<LevelMessage, "id">>) => Promise<boolean>;
+  deleteMessage: (id: string) => Promise<boolean>;
 
   hydrateStudents: (students: Student[]) => void;
   hydrateSessions: (sessions: Session[]) => void;
@@ -165,6 +166,36 @@ interface EnnajdState {
 
 function makeId(): string {
   return crypto.randomUUID();
+}
+
+/**
+ * The store write contract: snapshot → optimistic `set` → await the doc
+ * write → revert + toast on failure. Every persistence write goes through
+ * here so a Supabase rejection can never silently leave the local store
+ * ahead of the database (the "session/attendance vanished on refresh" bug:
+ * the optimistic row was discarded by the next realtime fetch while the
+ * failed insert was swallowed). `revert` restores the snapshotted slice and
+ * the translated toast tells the user the truth.
+ *
+ * Returns `true` when the write landed, `false` when it was rolled back —
+ * form dialogs awaiting an action gate their "saved" toast + close on it, so
+ * a rejected write keeps the dialog open instead of faking success.
+ */
+async function persist<T>(
+  prev: T,
+  revert: (prev: T) => void,
+  work: Promise<void>,
+  msg: DictKey,
+): Promise<boolean> {
+  try {
+    await work;
+    return true;
+  } catch (err) {
+    console.error("[ennajd] persistence write failed:", err);
+    revert(prev);
+    toast.error(t(msg));
+    return false;
+  }
 }
 
 /**
@@ -353,7 +384,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   hasSyncedStudents: false,
   hasSyncedSessions: false,
 
-  addStudent: (student) => {
+  addStudent: async (student) => {
     const createdAt = new Date().toISOString();
     const newStudent: Student = {
       ...student,
@@ -364,13 +395,24 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         enrolledAt: e.enrolledAt ?? createdAt,
       })),
     };
+    const prevStudents = get().students;
     set((state) => ({ students: [...state.students, newStudent] }));
-    void addStudentDoc(newStudent);
-    return newStudent;
+    // Awaited: callers (StudentFormSheet) distribute tuition right after this
+    // returns, and payments.student_id is an FK to this row — the insert must
+    // be confirmed before any child write. Returns null on failure so the
+    // form stays open.
+    const ok = await persist(
+      prevStudents,
+      (prev) => set({ students: prev }),
+      addStudentDoc(newStudent),
+      "studentSaveFailed",
+    );
+    return ok ? newStudent : null;
   },
 
-  updateStudent: (id, patch) => {
+  updateStudent: async (id, patch) => {
     let updated: Student | undefined;
+    const prevStudents = get().students;
     set((state) => ({
       students: state.students.map((s) => {
         if (s.id !== id) return s;
@@ -391,41 +433,77 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         return updated;
       }),
     }));
-    if (updated) void updateStudentDoc(id, updated);
+    if (updated) {
+      return await persist(
+        prevStudents,
+        (prev) => set({ students: prev }),
+        updateStudentDoc(id, updated),
+        "studentSaveFailed",
+      );
+    }
+    return false;
   },
 
-  deleteStudent: (id) => {
+  deleteStudent: async (id) => {
+    const prevStudents = get().students;
     set((state) => ({
       students: state.students.filter((s) => s.id !== id),
     }));
-    void deleteStudentDoc(id);
+    return await persist(
+      prevStudents,
+      (prev) => set({ students: prev }),
+      deleteStudentDoc(id),
+      "studentDeleteFailed",
+    );
   },
 
-  addSession: (session) => {
+  addSession: async (session) => {
     const newSession: Session = { ...session, id: makeId() };
+    const prevSessions = get().sessions;
     set((state) => ({ sessions: [...state.sessions, newSession] }));
-    void addSessionDoc(newSession);
-    return newSession;
+    // Awaited: attendance_records.session_id is an FK to this row, so the
+    // insert must land before any attendance write against it. Returns null
+    // on failure so the form stays open.
+    const ok = await persist(
+      prevSessions,
+      (prev) => set({ sessions: prev }),
+      addSessionDoc(newSession),
+      "sessionSaveFailed",
+    );
+    return ok ? newSession : null;
   },
 
-  updateSession: (id, patch) => {
+  updateSession: async (id, patch) => {
+    const prevSessions = get().sessions;
     set((state) => ({
       sessions: state.sessions.map((s) =>
         s.id === id ? { ...s, ...patch } : s,
       ),
     }));
-    void updateSessionDoc(id, patch);
+    return await persist(
+      prevSessions,
+      (prev) => set({ sessions: prev }),
+      updateSessionDoc(id, patch),
+      "sessionSaveFailed",
+    );
   },
 
-  deleteSession: (id) => {
+  deleteSession: async (id) => {
+    const prevSessions = get().sessions;
     set((state) => ({
       sessions: state.sessions.filter((s) => s.id !== id),
     }));
-    void deleteSessionDoc(id);
+    return await persist(
+      prevSessions,
+      (prev) => set({ sessions: prev }),
+      deleteSessionDoc(id),
+      "sessionDeleteFailed",
+    );
   },
 
-  setPrice: (entry) => {
+  setPrice: async (entry) => {
     let savedEntry: PriceEntry | undefined;
+    const prevPrices = get().prices;
     set((state) => {
       const existing = state.prices.find(
         (p) =>
@@ -447,7 +525,15 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         prices: [...state.prices, savedEntry],
       };
     });
-    if (savedEntry) void setPriceDoc(savedEntry);
+    if (savedEntry) {
+      return await persist(
+        prevPrices,
+        (prev) => set({ prices: prev }),
+        setPriceDoc(savedEntry),
+        "priceSaveFailed",
+      );
+    }
+    return false;
   },
 
   getBasePrice: (level, subject, track, groupType) => {
@@ -473,8 +559,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     return get().getBasePrice(student.level, subject, enrollment.track, enrollment.groupType);
   },
 
-  markAttendance: (studentId, sessionId, date, status, opts) => {
+  markAttendance: async (studentId, sessionId, date, status, opts) => {
     let savedRecord: AttendanceRecord | undefined;
+    // Snapshot BEFORE the optimistic set so a failed write can revert the
+    // chip exactly (attendance stays snappy; failures self-heal).
+    const prevAttendance = get().attendanceRecords;
     set((state) => {
       const existing = state.attendanceRecords.find(
         (r) =>
@@ -511,7 +600,15 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         attendanceRecords: [...state.attendanceRecords, record],
       };
     });
-    if (savedRecord) void markAttendanceDoc(savedRecord);
+    if (savedRecord) {
+      return await persist(
+        prevAttendance,
+        (prev) => set({ attendanceRecords: prev }),
+        markAttendanceDoc(savedRecord),
+        "attendanceSaveFailed",
+      );
+    }
+    return false;
   },
 
   getAttendanceFor: (sessionId, date) => {
@@ -520,7 +617,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     );
   },
 
-  runAutoAbsenceSweep: (now) => {
+  runAutoAbsenceSweep: async (now) => {
     // Throttle to once per minute to avoid unnecessary computations
     const nowMs = now.getTime();
     if (lastAutoAbsenceSweepMs !== null && nowMs - lastAutoAbsenceSweepMs < 60_000) {
@@ -571,16 +668,23 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     }
 
     if (newRecords.length > 0) {
+      const prevAttendance = get().attendanceRecords;
       set((s) => ({
         attendanceRecords: [...s.attendanceRecords, ...newRecords],
       }));
       // One batched commit instead of N individual setDoc calls → one
-      // snapshot echo instead of N.
-      void upsertAttendanceBatchDoc(newRecords);
+      // snapshot echo instead of N. Awaited so an offline failure reverts
+      // the local sweep instead of leaving it ahead of the DB.
+      await persist(
+        prevAttendance,
+        (prev) => set({ attendanceRecords: prev }),
+        upsertAttendanceBatchDoc(newRecords),
+        "attendanceSaveFailed",
+      );
     }
   },
 
-  sweepExpiredOneOffSessions: (now) => {
+  sweepExpiredOneOffSessions: async (now) => {
     const todayKey = formatDateKey(now);
     if (lastExpiredSweepDateKey === todayKey) return 0;
     lastExpiredSweepDateKey = todayKey;
@@ -590,14 +694,22 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     );
     if (expired.length === 0) return 0;
     const expiredIds = new Set(expired.map((s) => s.id));
+    const prevSessions = get().sessions;
     set((cur) => ({
       sessions: cur.sessions.filter((s) => !expiredIds.has(s.id)),
     }));
-    for (const s of expired) void deleteSessionDoc(s.id);
+    await persist(
+      prevSessions,
+      (prev) => set({ sessions: prev }),
+      Promise.all(expired.map((s) => deleteSessionDoc(s.id))).then(() =>
+        undefined,
+      ),
+      "sessionDeleteFailed",
+    );
     return expired.length;
   },
 
-  syncPayments: (now) => {
+  syncPayments: async (now) => {
     // Guards run BEFORE the throttle is consumed, so an early bail (not yet
     // hydrated / no students) does not block a later deferred retry.
 
@@ -631,10 +743,19 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     if (state.lastPaymentsSyncDateKey === todayKey) return;
     set({ lastPaymentsSyncDateKey: todayKey });
 
+    // Snapshot BOTH slices before any optimistic update so a failed write
+    // can revert generated installments AND advanceBalance changes together.
+    const previousPayments = state.payments;
+    const previousStudents = state.students;
+
     const existingKeys = new Set(
       state.payments.map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
     );
     const newPayments: Payment[] = [];
+    const advanceBalanceUpdates: Array<{
+      studentId: string;
+      nextBalance: number;
+    }> = [];
 
     for (const student of state.students) {
       const prevAdvanceBalance = student.advanceBalance ?? 0;
@@ -682,13 +803,33 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
                 : s2,
             ),
           }));
+          // Collect for persistence — the missing write that used to lose
+          // carried-forward credit on refresh.
+          advanceBalanceUpdates.push({
+            studentId: student.id,
+            nextBalance: remaining,
+          });
         }
       }
     }
 
-    if (newPayments.length > 0) {
-      set((s) => ({ payments: [...s.payments, ...newPayments] }));
-      void upsertPaymentsBatchDoc(newPayments);
+    if (newPayments.length === 0) return;
+
+    set((s) => ({ payments: [...s.payments, ...newPayments] }));
+    // Generated installments + advanceBalance consumptions are ONE logical
+    // change: commit both, or revert both slices together so the local store
+    // never diverges from the DB.
+    try {
+      await upsertPaymentsBatchDoc(newPayments);
+      for (const { studentId, nextBalance } of advanceBalanceUpdates) {
+        // The missing write that used to lose carried-forward credit on
+        // refresh — the balance is only local until this lands.
+        await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+      }
+    } catch (err) {
+      console.error("[ennajd] syncPayments write failed:", err);
+      set({ payments: previousPayments, students: previousStudents });
+      toast.error(t("paymentSaveFailed"));
     }
   },
 
@@ -704,7 +845,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       await setPaymentPaidDoc(paymentId, isPaid, updatedAt);
     } catch (err) {
       set({ payments: previous });
-      toast.error("Échec de l'enregistrement du paiement");
+      toast.error(t("paymentSaveFailed"));
     }
   },
 
@@ -745,68 +886,66 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       (p) => p.subject === subject,
     );
 
-    if (filteredGenerated.length > 0) {
-      set((s) => ({ payments: [...s.payments, ...filteredGenerated] }));
-      void upsertPaymentsBatchDoc(filteredGenerated);
-    }
-
-    // Re-read after generation so the waterfall sees the newly-created
-    // future installments.
-    const paymentsNow = get().payments;
-
-    // Apply the credit waterfall across ALL non-fully-paid installments for
-    // this student+subject, in dueDate-ascending order — due AND future.
-    // Surplus that can't be absorbed rolls forward month by month; any still
-    // unabsorbed credit becomes advanceBalance on the student record.
-    // Context is required so applyCreditWaterfall's subjectProration is
-    // populated (cross-subject proration map) — without it the waterfall
-    // falls back to plain gap-filling and Rules A-D are skipped.
-    const { updated, remaining, anyChanged } = applyCreditWaterfall(
-      paymentsNow,
-      studentId,
-      subject,
-      Math.round(amount),
-      asOfKey,
-      updatedAt,
-      { student, sessions: get().sessions, prices: get().prices },
-    );
-
-    if (!anyChanged) return;
-
-    const nextById = new Map(updated.map((p) => [p.id, p]));
-    set((state) => ({
-      payments: state.payments.map((p) => nextById.get(p.id) ?? p),
-    }));
-
-    // Snapshot + apply advanceBalance if surplus remains.
-    const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
-      (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
-    );
-
-    let commitAdvanceBalance = false;
-    if (remaining > 0) {
-      const prevBalance = student.advanceBalance ?? 0;
-      const nextBalance = prevBalance + remaining;
-      set((state) => ({
-        students: state.students.map((s) =>
-          s.id === studentId
-            ? { ...s, advanceBalance: nextBalance }
-            : s,
-        ),
-      }));
-      commitAdvanceBalance = true;
-    }
-
+    // Generated installments + credit patches are committed inside ONE try so
+    // a generation failure rolls back both (previously the generation upsert
+    // was fire-and-forget, leaving phantom rows the amount_paid patches then
+    // hit on non-existent records).
     try {
-      await updatePaymentsBatchDoc(patches);
-      if (commitAdvanceBalance) {
-        const prevBalance = student.advanceBalance ?? 0;
-        const nextBalance = prevBalance + remaining;
-        await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+      if (filteredGenerated.length > 0) {
+        set((s) => ({ payments: [...s.payments, ...filteredGenerated] }));
+        await upsertPaymentsBatchDoc(filteredGenerated);
+      }
+
+      // Re-read after generation so the waterfall sees the newly-created
+      // future installments.
+      const paymentsNow = get().payments;
+
+      // Apply the credit waterfall across ALL non-fully-paid installments for
+      // this student+subject, in dueDate-ascending order — due AND future.
+      // Surplus that can't be absorbed rolls forward month by month; any still
+      // unabsorbed credit becomes advanceBalance on the student record.
+      // Context is required so applyCreditWaterfall's subjectProration is
+      // populated (cross-subject proration map) — without it the waterfall
+      // falls back to plain gap-filling and Rules A-D are skipped.
+      const { updated, remaining, anyChanged } = applyCreditWaterfall(
+        paymentsNow,
+        studentId,
+        subject,
+        Math.round(amount),
+        asOfKey,
+        updatedAt,
+        { student, sessions: get().sessions, prices: get().prices },
+      );
+
+      if (anyChanged) {
+        const nextById = new Map(updated.map((p) => [p.id, p]));
+        set((state) => ({
+          payments: state.payments.map((p) => nextById.get(p.id) ?? p),
+        }));
+
+        const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
+          (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
+        );
+
+        await updatePaymentsBatchDoc(patches);
+
+        // Surplus remains → carry it forward as advanceBalance.
+        if (remaining > 0) {
+          const prevBalance = student.advanceBalance ?? 0;
+          const nextBalance = prevBalance + remaining;
+          set((state) => ({
+            students: state.students.map((s) =>
+              s.id === studentId
+                ? { ...s, advanceBalance: nextBalance }
+                : s,
+            ),
+          }));
+          await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+        }
       }
     } catch (err) {
       set({ payments: previousPayments, students: previousStudents });
-      toast.error("Échec de l'enregistrement du paiement");
+      toast.error(t("paymentSaveFailed"));
     }
   },
 
@@ -906,7 +1045,7 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
     await updatePaymentsBatchDoc(patches);
   } catch (err) {
     set({ payments: previous });
-    toast.error("Échec de l'enregistrement du paiement");
+    toast.error(t("paymentSaveFailed"));
   }
 },
 
@@ -1021,7 +1160,7 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
       }
     } catch (err) {
       set({ payments: previousPayments, students: previousStudents });
-      toast.error("Échec de l'enregistrement du paiement");
+      toast.error(t("paymentSaveFailed"));
       throw err;
     }
   },
@@ -1144,7 +1283,7 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
     return get().getOutstandingInstallment(studentId, subject, asOf) !== undefined;
   },
 
-  addMessage: (message) => {
+  addMessage: async (message) => {
     const now = new Date().toISOString();
     const newMessage: LevelMessage = {
       ...message,
@@ -1152,13 +1291,20 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
       createdAt: now,
       updatedAt: now,
     };
+    const prevMessages = get().messages;
     set((state) => ({ messages: [...state.messages, newMessage] }));
-    void upsertMessageDoc(newMessage);
-    return newMessage;
+    const ok = await persist(
+      prevMessages,
+      (prev) => set({ messages: prev }),
+      upsertMessageDoc(newMessage),
+      "messageSaveFailed",
+    );
+    return ok ? newMessage : null;
   },
 
-  updateMessage: (id, patch) => {
+  updateMessage: async (id, patch) => {
     let updated: LevelMessage | undefined;
+    const prevMessages = get().messages;
     set((state) => ({
       messages: state.messages.map((m) => {
         if (m.id !== id) return m;
@@ -1166,14 +1312,28 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
         return updated;
       }),
     }));
-    if (updated) void upsertMessageDoc(updated);
+    if (updated) {
+      return await persist(
+        prevMessages,
+        (prev) => set({ messages: prev }),
+        upsertMessageDoc(updated),
+        "messageSaveFailed",
+      );
+    }
+    return false;
   },
 
-  deleteMessage: (id) => {
+  deleteMessage: async (id) => {
+    const prevMessages = get().messages;
     set((state) => ({
       messages: state.messages.filter((m) => m.id !== id),
     }));
-    void deleteMessageDoc(id);
+    return await persist(
+      prevMessages,
+      (prev) => set({ messages: prev }),
+      deleteMessageDoc(id),
+      "messageSaveFailed",
+    );
   },
 
   hydrateStudents: (students) => {
@@ -1243,5 +1403,5 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
 function maybeRunPaymentSync(): void {
   const state = useEnnajdState.getState();
   if (!state.hasSyncedPayments || state.students.length === 0) return;
-  state.syncPayments(new Date());
+  void state.syncPayments(new Date());
 }

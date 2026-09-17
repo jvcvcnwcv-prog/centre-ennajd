@@ -371,6 +371,97 @@ export interface ReconcilePatch {
 }
 
 /**
+ * Authoritative Rule A reconciliation — the self-heal the daily sync
+ * actually applies. For every Rule A row it recomputes what the engine
+ * would charge today for that (student, subject, month) and classifies it:
+ *
+ *  - `update`  — the row is still billable but its amount drifted (price
+ *                change, timetable edit, engine migration): patch
+ *                `amountDue`, keep `amountPaid`, recompute `isPaid`.
+ *  - `delete`  — the engine would emit NO installment for that month at
+ *                all: the enrollment/price/timetable is gone, the month is
+ *                a gap month, or it predates enrollment. Such rows are
+ *                stale leftovers and are removed from the ledger.
+ *  - untouched — the amount already matches.
+ *
+ * Rule B rows are never classified. `reconcilePaymentAmounts` above is the
+ * update-only subset of this (kept for `regeneratePaymentLedger`-adjacent
+ * paths); this one additionally reports the rows that must go away, which
+ * is what stops old full-price months from lingering on the board forever.
+ * Pure — no React/Zustand, no hidden date().
+ */
+export interface ReconcileLedgerResult {
+  update: ReconcilePatch[];
+  delete: string[];
+}
+
+export function reconcileRuleALedger(
+  payments: Payment[],
+  students: Student[],
+  sessions: Session[],
+  prices: PriceEntry[],
+): ReconcileLedgerResult {
+  const studentsById = new Map(students.map((s) => [s.id, s]));
+  const update: ReconcilePatch[] = [];
+  const del: string[] = [];
+
+  for (const payment of payments) {
+    if (payment.rule !== "A") continue;
+
+    const student = studentsById.get(payment.studentId);
+    // Student gone (or the row is an orphan) → not billable anymore.
+    if (!student) {
+      del.push(payment.id);
+      continue;
+    }
+
+    const enrollment = student.enrollments.find((e) => e.subject === payment.subject);
+    // Enrollment dropped → the combo no longer exists → row is stale.
+    if (!enrollment) {
+      del.push(payment.id);
+      continue;
+    }
+
+    const price = getEffectivePriceFor(student, enrollment, prices);
+    // Price removed entirely (and no customPrice) → nothing to charge.
+    if (price === undefined) {
+      del.push(payment.id);
+      continue;
+    }
+
+    const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
+    const ctx = buildDeliveredDatesContext(
+      sessions,
+      [],
+      {
+        level: student.level,
+        subject: enrollment.subject,
+        track: enrollment.track,
+        groupType: enrollment.groupType,
+      },
+      enrolledAt,
+    );
+
+    const expected = computeExpectedMonthAmount(enrolledAt, payment.month, ctx, price);
+    if (expected === null) {
+      // No timetable / gap month / pre-enrollment month → no installment.
+      del.push(payment.id);
+      continue;
+    }
+
+    if (expected !== payment.amountDue) {
+      update.push({
+        id: payment.id,
+        amountDue: expected,
+        isPaid: (payment.amountPaid ?? 0) >= expected,
+      });
+    }
+  }
+
+  return { update, delete: del };
+}
+
+/**
  * Recomputes the expected `amountDue` of every Rule A installment and
  * reports the ones that drifted (price change, timetable edit, engine
  * migration). `isPaid` is recomputed strictly from `amountPaid` — a row

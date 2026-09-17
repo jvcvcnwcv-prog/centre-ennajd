@@ -13,6 +13,7 @@ import {
   getPaymentRuleFor,
   isPaymentFullyPaid,
   reconcilePaymentAmounts,
+  reconcileRuleALedger,
 } from "./ennajd-billing";
 import type {
   GroupType,
@@ -528,6 +529,140 @@ describe("reconcilePaymentAmounts", () => {
       prices,
     );
     expect(patches[0].amountDue).toBe(300);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileRuleALedger — authoritative self-heal (update + delete)
+// ---------------------------------------------------------------------------
+
+describe("reconcileRuleALedger", () => {
+  const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
+  const prices: PriceEntry[] = [
+    {
+      id: "price-1",
+      level: "T.C",
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      price: PRICE,
+    },
+  ];
+
+  function ledgerStudent(enrolledAt = `2025-01-01${NOON}`): Student {
+    const enrollment: SubjectEnrollment = {
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      enrolledAt,
+    };
+    return makeStudent({ level: "T.C", enrollments: [enrollment] });
+  }
+
+  it("reports a stale Rule A amount as an update (paid progress preserved)", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 150, false),
+    ];
+    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
+    expect(result.delete).toEqual([]);
+    expect(result.update).toEqual([
+      { id: "p1", amountDue: 400, isPaid: false }, // 150 < 400
+    ]);
+  });
+
+  it("reports a correct row as untouched", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 400, true),
+    ];
+    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
+    expect(result.update).toEqual([]);
+    expect(result.delete).toEqual([]);
+  });
+
+  it("deletes a row whose month is no longer billable (timetable removed)", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      [], // no sessions → no timetable
+      prices,
+    );
+    expect(result.update).toEqual([]);
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("deletes a row whose enrollment was dropped", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const studentWithNoEnrollments = makeStudent({
+      level: "T.C",
+      enrollments: [],
+    });
+    const result = reconcileRuleALedger(
+      payments,
+      [studentWithNoEnrollments],
+      sessions,
+      prices,
+    );
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("deletes a row whose price no longer resolves", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, []);
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("deletes a row predating enrollment", () => {
+    // Enrolled Jan 15; a leftover row for December (before enrollment at
+    // all) must be deleted — the engine emits nothing for it.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2024-12-01", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent(`2025-01-15${NOON}`)],
+      sessions,
+      prices,
+    );
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("deletes an orphan row whose student no longer exists", () => {
+    const payments: Payment[] = [
+      makePayment("p1", "ghost", "Math", "2025-01-01", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("never touches Rule B rows, even stale ones", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 999, 0, false, "B"),
+    ];
+    const result = reconcileRuleALedger(payments, [ledgerStudent()], [], []);
+    expect(result.update).toEqual([]);
+    expect(result.delete).toEqual([]);
+  });
+
+  it("updates a mid-month-join row to the prorated amount", () => {
+    // Joined Jan 15 (Wednesday) → 3 of 4 sessions remain → 300, not 400.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-15", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent(`2025-01-15${NOON}`)],
+      sessions,
+      prices,
+    );
+    expect(result.delete).toEqual([]);
+    expect(result.update).toEqual([{ id: "p1", amountDue: 300, isPaid: false }]);
   });
 });
 

@@ -20,7 +20,7 @@ import {
   getPaymentRuleFor,
   isPaymentFullyPaid,
   getPaymentRemaining,
-  reconcilePaymentAmounts,
+  reconcileRuleALedger,
   REGISTRATION_FEE_DEFAULT,
   type DeliveredDatesContext,
 } from "@/lib/ennajd-billing";
@@ -813,27 +813,34 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       }
     }
 
-    // SELF-HEAL: recompute stale Rule A amounts (price/timetable edits,
-    // engine migration). Rule B and customPrice rows are never touched; a
-    // row stays paid only when amountPaid covers the NEW amountDue. Patches
-    // are merged into the same outgoing batch as generated installments.
-    // Reads the CURRENT ledger so advance-credit patches applied in the loop
-    // above are preserved on the reconciled rows.
+    // SELF-HEAL: make the Rule A ledger AUTHORITATIVE. Beyond patching rows
+    // whose amount drifted (price/timetable edits, engine migration), this
+    // also deletes Rule A rows the engine would no longer emit at all — a
+    // removed timetable/enrollment/price, a gap month, or a month predating
+    // enrollment. Those stale rows are what kept showing an old full-price
+    // month on the board after the rewrite. Rule B rows are never touched;
+    // a patched row keeps its amountPaid and stays paid only when that paid
+    // amount covers the NEW amountDue. Reads the CURRENT ledger so the
+    // advance-credit patches applied in the loop above survive the rebuild.
     const currentPayments = get().payments;
-    const reconcilePatches = reconcilePaymentAmounts(
+    const reconcile = reconcileRuleALedger(
       currentPayments,
       get().students,
       get().sessions,
       get().prices,
     );
-    if (reconcilePatches.length > 0) {
-      const reconcileById = new Map(
-        reconcilePatches.map((p) => [p.id, p]),
-      );
-      for (const patch of reconcilePatches) {
+    // Rebuilt rows for the DB upsert — kept OUT of `newPayments` so they
+    // are never appended twice to the local ledger (they are applied
+    // in place by the map below).
+    const reconciledPayments: Payment[] = [];
+    const deletedPaymentIds: string[] = reconcile.delete;
+
+    if (reconcile.update.length > 0) {
+      const reconcileById = new Map(reconcile.update.map((p) => [p.id, p]));
+      for (const patch of reconcile.update) {
         const existing = currentPayments.find((p) => p.id === patch.id);
         if (!existing) continue;
-        newPayments.push({
+        reconciledPayments.push({
           ...existing,
           amountDue: patch.amountDue,
           isPaid: patch.isPaid,
@@ -849,15 +856,29 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         }),
       }));
     }
+    if (deletedPaymentIds.length > 0) {
+      const deletedSet = new Set(deletedPaymentIds);
+      set((s) => ({
+        payments: s.payments.filter((p) => !deletedSet.has(p.id)),
+      }));
+    }
 
-    if (newPayments.length === 0) return;
+    if (newPayments.length === 0 && reconciledPayments.length === 0 && deletedPaymentIds.length === 0) {
+      return;
+    }
 
     set((s) => ({ payments: [...s.payments, ...newPayments] }));
     // Generated installments + advanceBalance consumptions are ONE logical
     // change: commit both, or revert both slices together so the local store
     // never diverges from the DB.
     try {
-      await upsertPaymentsBatchDoc(newPayments);
+      const upsertRows = [...newPayments, ...reconciledPayments];
+      if (upsertRows.length > 0) {
+        await upsertPaymentsBatchDoc(upsertRows);
+      }
+      if (deletedPaymentIds.length > 0) {
+        await deletePaymentsBatchDoc(deletedPaymentIds);
+      }
       for (const { studentId, nextBalance } of advanceBalanceUpdates) {
         // The missing write that used to lose carried-forward credit on
         // refresh — the balance is only local until this lands.

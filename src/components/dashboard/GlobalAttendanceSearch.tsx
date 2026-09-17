@@ -148,7 +148,7 @@ export function GlobalAttendanceSearch({ now, date, liveSessions }: GlobalAttend
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, []);
 
-  function commitSelection(student: Student) {
+  async function commitSelection(student: Student) {
     const matches = resolveLiveMatchesFor(student, liveSessions);
     const fullName = `${student.firstName} ${student.lastName}`;
 
@@ -162,11 +162,15 @@ export function GlobalAttendanceSearch({ now, date, liveSessions }: GlobalAttend
     // in multiple subjects (e.g. Math + PC) whose sessions were both live would
     // get attendance recorded for every subject simultaneously.
     const match = matches[0];
-    markAttendance(student.id, match.session.id, date, "present", {
+    // Optimistic write: the chip flips instantly; the success toast waits for
+    // the confirmed write. On failure the store reverts + toasts the error.
+    const ok = await markAttendance(student.id, match.session.id, date, "present", {
       isManualOverride: true,
       isGuest: match.isGuest,
     });
-    toast.success(`${fullName} — ${t("present")} ✓`, { duration: 2000 });
+    if (ok) {
+      toast.success(`${fullName} — ${t("present")} ✓`, { duration: 2000 });
+    }
 
     // Unpaid warning right after the success toast: list every subject this
     // student still owes money for, computed from due-unpaid installments.

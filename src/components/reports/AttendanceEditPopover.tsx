@@ -56,12 +56,15 @@ export function AttendanceEditPopover({
     year: "numeric",
   });
 
-  function applyStatus(sessionId: string, status: AttendanceStatus, isGuest: boolean) {
-    markAttendance(student.id, sessionId, date, status, {
+  async function applyStatus(sessionId: string, status: AttendanceStatus, isGuest: boolean) {
+    // Chip update is optimistic (instant); the success toast only fires once
+    // the write is confirmed. On failure the store reverts the chip and fires
+    // the error toast itself.
+    const ok = await markAttendance(student.id, sessionId, date, status, {
       isManualOverride: true,
       isGuest,
     });
-    toast.success(t("attendanceSaved"));
+    if (ok) toast.success(t("attendanceSaved"));
   }
 
   // Editing an existing record always targets that record's session (keeps

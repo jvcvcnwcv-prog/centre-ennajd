@@ -112,16 +112,28 @@ export function updateStudentDoc(
   );
 }
 
-export function updateStudentAdvanceBalanceDoc(
+export async function updateStudentAdvanceBalanceDoc(
   id: string,
   advanceBalance: number,
 ): Promise<void> {
-  return wrapSupabaseVoid(
-    supabase
-      .from("students")
-      .update({ advance_balance: Math.max(0, Math.round(advanceBalance)) } as never)
-      .eq("id", id),
-  );
+  try {
+    await wrapSupabaseVoid(
+      supabase
+        .from("students")
+        .update({ advance_balance: Math.max(0, Math.round(advanceBalance)) } as never)
+        .eq("id", id),
+    );
+  } catch (error) {
+    // A missing `advance_balance` column (database not yet migrated) makes
+    // this write fail with PGRST204. The credit balance is optional across
+    // the app, so log instead of propagating — payment distribution flows
+    // (applyInitialTuitionPayment, recordPartialPayment, syncPayments) must
+    // never break because of it.
+    console.error(
+      "updateStudentAdvanceBalanceDoc: could not persist advance_balance",
+      error,
+    );
+  }
 }
 
 export function deleteStudentDoc(id: string): Promise<void> {

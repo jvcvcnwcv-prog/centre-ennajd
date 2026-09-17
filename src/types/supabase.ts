@@ -34,7 +34,9 @@ export interface Database {
           created_at: string;
           updated_at: string;
           registration_fee: RegistrationFee | null;
-          advance_balance: number;
+          // Optional: a database that hasn't run the advance_balance
+          // migration won't return this column, and readers normalise with ?? 0.
+          advance_balance?: number;
         };
         Insert: {
           id?: string;

@@ -22,7 +22,7 @@ import type {
 // --- Student conversion ------------------------------------------------
 
 export function studentToRow(student: Student): StudentsRow {
-  return {
+  const row: StudentsRow = {
     id: student.id,
     first_name: student.firstName,
     last_name: student.lastName,
@@ -37,8 +37,14 @@ export function studentToRow(student: Student): StudentsRow {
     registration_fee:
       ((student.registrationFee as unknown) as StudentsRow["registration_fee"]) ??
       null,
-    advance_balance: student.advanceBalance ?? 0,
   };
+  // Only persist advance_balance when it is non-zero: the column defaults to
+  // 0, so omitting it is behaviourally identical, and it keeps student
+  // inserts working even on databases where the column is not migrated yet.
+  if (student.advanceBalance) {
+    row.advance_balance = student.advanceBalance;
+  }
+  return row;
 }
 
 export function rowToStudent(row: StudentsRow): Student {

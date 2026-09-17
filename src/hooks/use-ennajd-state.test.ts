@@ -5,6 +5,7 @@
 // Run with: npx vitest run src/hooks/use-ennajd-state.test.ts
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { isPaymentFullyPaid } from "../lib/ennajd-billing";
 import { useEnnajdState } from "./use-ennajd-state";
 import type {
   AttendanceRecord,
@@ -184,6 +185,13 @@ function ledgerByMonth(): Map<string, Payment> {
   return new Map(useEnnajdState.getState().payments.map((p) => [p.month, p]));
 }
 
+/** Every payment id handed to `deletePaymentsBatchDoc` so far in this test. */
+async function deletePaymentsBatchDocIds(): Promise<string[]> {
+  const db = await import("@/lib/dbServices");
+  const calls = vi.mocked(db.deletePaymentsBatchDoc).mock.calls as unknown as string[][];
+  return calls.flat();
+}
+
 describe("reactive ledger — markAttendance trigger", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -252,11 +260,17 @@ describe("reactive ledger — markAttendance trigger", () => {
   });
 
   it("confirms the recalc with a toast naming the student", async () => {
-    seedRuleALedger([payment("sept", "2026-09-15", 219)]);
+    // Over-charged settled Sept: the forced sync re-anchors Sept to 175 and
+    // leaves the 175 surplus on the row, and the recalc then cascades that
+    // surplus onto Oct — real ledger work the toast confirms.
+    seedRuleALedger([
+      payment("sept", "2026-09-15", 350, "A", 350),
+      payment("oct", "2026-10-01", 350),
+    ]);
 
     await useEnnajdState
       .getState()
-      .markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
+      .markAttendance(STUDENT_ID, "session-math-thu", "2026-09-17", "present");
     await flushReactive();
 
     expect(toast.success).toHaveBeenCalledTimes(1);
@@ -290,15 +304,19 @@ describe("reactive ledger — markAttendance trigger", () => {
 
   it("deletes stale rows BEFORE upserting rebuilt ones (unique-constraint safe)", async () => {
     // Two rows share the Sept month; the 10/09 mark re-anchors Sept onto a
-    // new dueDate. The rebuild reuses one row and must delete the surplus
-    // BEFORE the insert, or the unique(student, subject, due_date) index
-    // would reject the whole batch.
+    // new dueDate. The collapse must delete the surplus row BEFORE the
+    // re-dated survivor is upserted, or the unique(student, subject,
+    // due_date) index would reject the whole batch.
     seedRuleALedger([
       payment("sept", "2026-09-15", 219),
       payment("sept-dup", "2026-09-17", 100),
       payment("oct", "2026-10-01", 350),
       payment("nov", "2026-11-01", 350),
     ]);
+
+    // The db mocks accumulate calls across this file's tests — clear so
+    // every order number below belongs to THIS mark's write path.
+    vi.clearAllMocks();
 
     await useEnnajdState
       .getState()
@@ -310,10 +328,15 @@ describe("reactive ledger — markAttendance trigger", () => {
     const upsertOrders = vi.mocked(db.upsertPaymentsBatchDoc).mock.invocationCallOrder;
     expect(deleteOrders.length).toBeGreaterThan(0);
     expect(upsertOrders.length).toBeGreaterThan(0);
-    // The recalc's own delete lands before its own upsert.
-    expect(deleteOrders.at(-1)!).toBeLessThan(upsertOrders.at(-1)!);
+    // EVERY delete lands before EVERY upsert (the collapse in the forced
+    // sync, and the reactive recalc's own rebuild, both write in this order).
+    const lastDelete = Math.max(...deleteOrders);
+    const firstUpsert = Math.min(...upsertOrders);
+    expect(lastDelete).toBeLessThan(firstUpsert);
 
-    // Exactly one row per month survived the rebuild.
+    // The surplus Sept row is gone...
+    expect(await deletePaymentsBatchDocIds()).toContain("sept-dup");
+    // ...and exactly one row per month survived.
     const months = useEnnajdState.getState().payments.map((p) => p.month);
     const counts = new Map<string, number>();
     for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
@@ -489,3 +512,54 @@ describe("regeneratePaymentLedger", () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------//
+// recordPartialPayment — the wallet waterfall lands surplus on the NEXT month's
+// gap, not on a duplicate of the same month.
+// ---------------------------------------------------------------------------//
+
+describe("recordPartialPayment — waterfall", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetStore();
+    vi.clearAllMocks();
+  });
+
+  it("absorbs a 350 payment as Sept 175 + Oct 175, one row per month", async () => {
+    // The September amount is 175 (a 17/09 joiner, 4 sessions × 43.75). A
+    // 350 payment fills Sept entirely and lands the 175 surplus on October's
+    // gap — never on a second September row.
+    seedRuleALedger([
+      payment("sept", "2026-09-17", 175),
+      payment("oct", "2026-10-01", 350),
+      payment("nov", "2026-11-01", 350),
+    ]);
+
+    await useEnnajdState
+      .getState()
+      .recordPartialPayment(STUDENT_ID, "Math", 350, new Date("2026-10-15T12:00:00"));
+
+    const ledger = ledgerByMonth();
+    expect(ledger.get("2026-09")!.amountPaid).toBe(175);
+    expect(isPaymentFullyPaid(ledger.get("2026-09")!)).toBe(true);
+    expect(ledger.get("2026-10")!.amountPaid).toBe(175);
+    expect(ledger.get("2026-10")!.amountDue).toBe(350);
+    expect(ledger.get("2026-10")!.isPaid).toBe(false);
+    // November untouched — the waterfall stops when the credit runs out.
+    expect(ledger.get("2026-11")!.amountPaid).toBe(0);
+
+    // Exactly one row per month — the waterfall never mints a duplicate.
+    const months = useEnnajdState.getState().payments.map((p) => p.month);
+    const counts = new Map<string, number>();
+    for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
+    for (const count of counts.values()) expect(count).toBe(1);
+
+    // The surplus was absorbed, so nothing was parked in advanceBalance.
+    expect(
+      useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
+        .advanceBalance ?? 0,
+    ).toBe(0);
+  });
+});
+

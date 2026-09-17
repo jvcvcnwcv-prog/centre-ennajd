@@ -330,6 +330,30 @@ export function computeExpectedMonthAmount(
 }
 
 /**
+ * The dueDate the engine would emit for a given month: the anchor itself
+ * for the join month (the anchor session is billable), the 1st of the month
+ * for every later month. Mirrors `generateSessionBasedSchedule`'s dueDate
+ * logic so the reconcile pass can re-date a surviving row onto exactly the
+ * date the generator would have used. Returns `null` for a malformed
+ * monthKey (the caller treats that month as non-billable anyway).
+ */
+export function computeExpectedMonthDueDate(
+  anchor: Date,
+  monthKey: string, // "YYYY-MM"
+): string | null {
+  const [yearStr, monthStr] = monthKey.split("-");
+  const year = Number(yearStr);
+  const monthIndex0 = Number(monthStr) - 1;
+  if (!Number.isFinite(year) || !Number.isFinite(monthIndex0)) return null;
+
+  const isJoinMonth =
+    year === anchor.getFullYear() && monthIndex0 === anchor.getMonth();
+  return isJoinMonth
+    ? formatDateKey(anchor)
+    : formatDateKey(new Date(year, monthIndex0, 1));
+}
+
+/**
  * Rule A schedule — session-based pricing. For every month from the join
  * month through `asOf`, emits one installment whose amount is
  * perSession × (sessions the student will attend that month):
@@ -442,7 +466,16 @@ export function formatMonthKey(date: Date): string {
 export interface ReconcilePatch {
   id: string;
   amountDue: number;
-  /** Recomputed isPaid: true only when amountPaid covers the NEW amountDue. */
+  /** The engine's dueDate for this month — the anchor itself for the join
+   *  month, the 1st otherwise. A re-anchor moves the surviving row onto this
+   *  date (the surplus row occupying it is reported for deletion). */
+  dueDate: string;
+  /** The group's CONSOLIDATED amountPaid — both duplicates of a month can
+   *  carry waterfall credit, so collapsing must pool it onto the keeper or
+   *  the credit would vanish. Overpayment above amountDue stays on the row. */
+  amountPaid: number;
+  /** Recomputed isPaid: true only when the consolidated amountPaid covers
+   *  the NEW amountDue. */
   isPaid: boolean;
 }
 
@@ -490,27 +523,55 @@ export function reconcileRuleALedger(
   const update: ReconcilePatch[] = [];
   const del: string[] = [];
 
+  // INVARIANT: exactly ONE Rule A row per (student, subject, month). The
+  // generator's dedupe key used to be `dueDate`, so a moved anchor minted a
+  // SECOND row for the same month and this pass patched each one
+  // independently — the report matrix then summed two identical charges
+  // (438 = 219 + 219). Grouping by calendar month lets one reconcile pass
+  // collapse the whole group onto a single survivor.
+  const groups: Array<{
+    studentId: string;
+    subject: Subject;
+    month: string;
+    rows: Payment[];
+  }> = [];
+  const groupIndex = new Map<string, number>();
   for (const payment of payments) {
     if (payment.rule !== "A") continue;
+    const key = `${payment.studentId}__${payment.subject}__${payment.month}`;
+    const idx = groupIndex.get(key);
+    if (idx === undefined) {
+      groupIndex.set(key, groups.length);
+      groups.push({
+        studentId: payment.studentId,
+        subject: payment.subject,
+        month: payment.month,
+        rows: [payment],
+      });
+    } else {
+      groups[idx].rows.push(payment);
+    }
+  }
 
-    const student = studentsById.get(payment.studentId);
-    // Student gone (or the row is an orphan) → not billable anymore.
+  for (const group of groups) {
+    const student = studentsById.get(group.studentId);
+    // Student gone (or the rows are orphans) → not billable anymore.
     if (!student) {
-      del.push(payment.id);
+      del.push(...group.rows.map((p) => p.id));
       continue;
     }
 
-    const enrollment = student.enrollments.find((e) => e.subject === payment.subject);
-    // Enrollment dropped → the combo no longer exists → row is stale.
+    const enrollment = student.enrollments.find((e) => e.subject === group.subject);
+    // Enrollment dropped → the combo no longer exists → rows are stale.
     if (!enrollment) {
-      del.push(payment.id);
+      del.push(...group.rows.map((p) => p.id));
       continue;
     }
 
     const price = getEffectivePriceFor(student, enrollment, prices);
     // Price removed entirely (and no customPrice) → nothing to charge.
     if (price === undefined) {
-      del.push(payment.id);
+      del.push(...group.rows.map((p) => p.id));
       continue;
     }
 
@@ -518,8 +579,8 @@ export function reconcileRuleALedger(
     const anchor =
       asOfKey !== undefined
         ? earliestValidAttendanceDate(
-            payment.studentId,
-            payment.subject,
+            group.studentId,
+            group.subject,
             attendanceRecords,
             sessions,
             asOfKey,
@@ -537,18 +598,46 @@ export function reconcileRuleALedger(
       anchor,
     );
 
-    const expected = computeExpectedMonthAmount(anchor, payment.month, ctx, price);
+    const expected = computeExpectedMonthAmount(anchor, group.month, ctx, price);
     if (expected === null) {
-      // No timetable / gap month / pre-enrollment month → no installment.
-      del.push(payment.id);
+      // No timetable / gap month / pre-enrollment month / lone session →
+      // the engine emits NO installment for this month, so the whole group
+      // is stale and must go.
+      del.push(...group.rows.map((p) => p.id));
       continue;
     }
 
-    if (expected !== payment.amountDue) {
+    // Keep ONE representative (the most-settled row, same rule as
+    // `dedupePayments`); every other row of the month is surplus and is
+    // deleted so the ledger stays exactly one row per month.
+    const keeper = group.rows.reduce((best, p) =>
+      isMoreSettledPayment(p, best) ? p : best,
+    );
+    for (const p of group.rows) {
+      if (p.id !== keeper.id) del.push(p.id);
+    }
+
+    // Paid credit across the WHOLE group is consolidated onto the keeper —
+    // both duplicates can carry waterfall credit, and collapsing without
+    // pooling it would silently lose payment progress.
+    const consolidatedPaid = group.rows.reduce(
+      (sum, p) => sum + (p.amountPaid ?? 0),
+      0,
+    );
+    const expectedDueDate =
+      computeExpectedMonthDueDate(anchor, group.month) ?? keeper.dueDate;
+
+    if (
+      expected !== keeper.amountDue ||
+      expectedDueDate !== keeper.dueDate ||
+      consolidatedPaid !== (keeper.amountPaid ?? 0)
+    ) {
       update.push({
-        id: payment.id,
+        id: keeper.id,
         amountDue: expected,
-        isPaid: (payment.amountPaid ?? 0) >= expected,
+        dueDate: expectedDueDate,
+        amountPaid: consolidatedPaid,
+        isPaid: consolidatedPaid >= expected,
       });
     }
   }
@@ -577,11 +666,41 @@ export function reconcilePaymentAmounts(
   const studentsById = new Map(students.map((s) => [s.id, s]));
   const patches: ReconcilePatch[] = [];
 
+  // Month-grouped, keeper-only: a (student, subject, month) that carries
+  // more than one row (a moved anchor's leftover) is patched on ONE
+  // representative only — the most-settled row, same pick as
+  // `reconcileRuleALedger`. The surplus rows are never patched here; they
+  // are wiped by the collapse/delete paths (`reconcileRuleALedger`,
+  // `dedupePayments`), so double-patching them would inflate the ledger
+  // until that happens.
+  const groups: Array<{
+    studentId: string;
+    subject: Subject;
+    month: string;
+    rows: Payment[];
+  }> = [];
+  const groupIndex = new Map<string, number>();
   for (const payment of payments) {
     if (payment.rule !== "A") continue;
-    const student = studentsById.get(payment.studentId);
+    const key = `${payment.studentId}__${payment.subject}__${payment.month}`;
+    const idx = groupIndex.get(key);
+    if (idx === undefined) {
+      groupIndex.set(key, groups.length);
+      groups.push({
+        studentId: payment.studentId,
+        subject: payment.subject,
+        month: payment.month,
+        rows: [payment],
+      });
+    } else {
+      groups[idx].rows.push(payment);
+    }
+  }
+
+  for (const group of groups) {
+    const student = studentsById.get(group.studentId);
     if (!student) continue;
-    const enrollment = student.enrollments.find((e) => e.subject === payment.subject);
+    const enrollment = student.enrollments.find((e) => e.subject === group.subject);
     if (!enrollment) continue;
 
     const price = getEffectivePriceFor(
@@ -595,8 +714,8 @@ export function reconcilePaymentAmounts(
     const anchor =
       asOfKey !== undefined
         ? earliestValidAttendanceDate(
-            payment.studentId,
-            payment.subject,
+            group.studentId,
+            group.subject,
             attendanceRecords,
             sessions,
             asOfKey,
@@ -614,13 +733,26 @@ export function reconcilePaymentAmounts(
       anchor,
     );
 
-    const expected = computeExpectedMonthAmount(anchor, payment.month, ctx, price);
-    if (expected === null || expected === payment.amountDue) continue;
+    const expected = computeExpectedMonthAmount(anchor, group.month, ctx, price);
+    if (expected === null) continue;
+
+    const keeper = group.rows.reduce((best, p) =>
+      isMoreSettledPayment(p, best) ? p : best,
+    );
+    const expectedDueDate =
+      computeExpectedMonthDueDate(anchor, group.month) ?? keeper.dueDate;
+    const keeperPaid = keeper.amountPaid ?? 0;
+
+    if (expected === keeper.amountDue && expectedDueDate === keeper.dueDate) {
+      continue;
+    }
 
     patches.push({
-      id: payment.id,
+      id: keeper.id,
       amountDue: expected,
-      isPaid: (payment.amountPaid ?? 0) >= expected,
+      dueDate: expectedDueDate,
+      amountPaid: keeperPaid,
+      isPaid: keeperPaid >= expected,
     });
   }
 
@@ -1266,9 +1398,15 @@ export function aggregateSettledInstallments(
 // Ledger de-duplication (defensive self-heal)
 // ---------------------------------------------------------------------------//
 
-/** Logical identity of an installment — the same key `syncPayments` dedupes on. */
+/**
+ * Logical identity of an installment: the CALENDAR MONTH it bills. Keying on
+ * `month` (not `dueDate`) is what makes the hydration self-heal wipe
+ * pre-existing DB duplicates — a re-dated duplicate of the same month shares
+ * the month even when its dueDate moved. Rule B rows keep the same key: a
+ * rolling cycle emits exactly one charge per calendar month too.
+ */
 function paymentLogicalKey(payment: Payment): string {
-  return `${payment.studentId}__${payment.subject}__${payment.dueDate}`;
+  return `${payment.studentId}__${payment.subject}__${payment.month}`;
 }
 
 /**
@@ -1277,7 +1415,7 @@ function paymentLogicalKey(payment: Payment): string {
  * of a pristine one: settled flag first, then largest amountPaid, then most
  * recent updatedAt.
  */
-function isMoreSettledPayment(a: Payment, b: Payment): boolean {
+export function isMoreSettledPayment(a: Payment, b: Payment): boolean {
   if (a.isPaid !== b.isPaid) return a.isPaid;
   const aPaid = a.amountPaid ?? 0;
   const bPaid = b.amountPaid ?? 0;
@@ -1293,13 +1431,14 @@ export interface PaymentDedupeResult {
 }
 
 /**
- * Collapses a ledger to exactly one row per `studentId__subject__dueDate`.
+ * Collapses a ledger to exactly one row per `studentId__subject__month`.
  * Duplicates slip in when the schedule generator runs before the payments
  * listener has hydrated (empty local ledger → whole schedule regenerated with
- * fresh ids). Pure defensive pass: rows are identical-by-design (same key =
- * same installment), so surplus rows are reported for deletion. Returns the
- * original array reference untouched when the ledger is already clean, so
- * `replaceIfChanged` can short-circuit.
+ * fresh ids), or when a re-anchor re-dates the join month onto a dueDate a
+ * leftover row still occupies. Pure defensive pass: rows are
+ * identical-by-design (same key = same installment), so surplus rows are
+ * reported for deletion. Returns the original array reference untouched when
+ * the ledger is already clean, so `replaceIfChanged` can short-circuit.
  */
 export function dedupePayments(payments: Payment[]): PaymentDedupeResult {
   const bestByKey = new Map<string, Payment>();

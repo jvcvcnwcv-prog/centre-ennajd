@@ -19,6 +19,7 @@ import {
   formatDateKey,
   generateScheduleFor,
   getPaymentRuleFor,
+  isMoreSettledPayment,
   isPaymentFullyPaid,
   getPaymentRemaining,
   recalculateStudentSubjectLedger,
@@ -343,7 +344,12 @@ function generateInstallmentsForStudent(
     // resolved from getEffectivePrice (which honors customPrice).
     const schedule = generateScheduleFor(rule, anchor, asOf, ctx, fullPrice);
     for (const installment of schedule) {
-      const key = `${student.id}__${enrollment.subject}__${installment.dueDate}`;
+      // MONTH-keyed guard: a moved anchor re-dates the join month onto a new
+      // dueDate, and a dueDate-keyed guard would then mint a SECOND row for
+      // a month that already has one (the 438 = 219 + 219 leak). Keying on
+      // rule + calendar month keeps exactly one row per month; the reconcile
+      // pass then corrects that row's amount + dueDate in place.
+      const key = `${student.id}__${enrollment.subject}__${rule}__${installment.monthKey}`;
       if (existingKeys.has(key)) continue;
       existingKeys.add(key);
       generated.push({
@@ -822,7 +828,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const previousStudents = state.students;
 
     const existingKeys = new Set(
-      state.payments.map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
+      state.payments.map((p) => `${p.studentId}__${p.subject}__${p.rule}__${p.month}`),
     );
     const newPayments: Payment[] = [];
     const advanceBalanceUpdates: Array<{
@@ -917,6 +923,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         reconciledPayments.push({
           ...existing,
           amountDue: patch.amountDue,
+          dueDate: patch.dueDate,
+          amountPaid: patch.amountPaid,
           isPaid: patch.isPaid,
           updatedAt: now.toISOString(),
         });
@@ -925,7 +933,14 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         payments: s.payments.map((p) => {
           const patch = reconcileById.get(p.id);
           return patch
-            ? { ...p, amountDue: patch.amountDue, isPaid: patch.isPaid, updatedAt: now.toISOString() }
+            ? {
+                ...p,
+                amountDue: patch.amountDue,
+                dueDate: patch.dueDate,
+                amountPaid: patch.amountPaid,
+                isPaid: patch.isPaid,
+                updatedAt: now.toISOString(),
+              }
             : p;
         }),
       }));
@@ -946,12 +961,17 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     // change: commit both, or revert both slices together so the local store
     // never diverges from the DB.
     try {
+      // DELETE BEFORE UPSERT: collapsing a month can RE-DATE the surviving
+      // row onto a `due_date` a surplus row still occupies. Deleting the
+      // surplus first keeps the unique(student_id, subject, due_date)
+      // constraint satisfiable — upserting first would trip it and the
+      // whole batch would roll back.
+      if (deletedPaymentIds.length > 0) {
+        await deletePaymentsBatchDoc(deletedPaymentIds);
+      }
       const upsertRows = [...newPayments, ...reconciledPayments];
       if (upsertRows.length > 0) {
         await upsertPaymentsBatchDoc(upsertRows);
-      }
-      if (deletedPaymentIds.length > 0) {
-        await deletePaymentsBatchDoc(deletedPaymentIds);
       }
       for (const { studentId, nextBalance } of advanceBalanceUpdates) {
         // The missing write that used to lose carried-forward credit on
@@ -1122,7 +1142,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const existingKeys = new Set(
       previousPayments
         .filter((p) => p.studentId === studentId && p.subject === subject)
-        .map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
+        .map((p) => `${p.studentId}__${p.subject}__${p.rule}__${p.month}`),
     );
     // Generate one month ahead so the surplus can land on next month's bill.
     const generateThrough = new Date(asOf);
@@ -1341,7 +1361,7 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
     const existingKeys = new Set(
       previousPayments
         .filter((p) => p.studentId === studentId)
-        .map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
+        .map((p) => `${p.studentId}__${p.subject}__${p.rule}__${p.month}`),
     );
     const generateThrough = new Date(asOf);
     generateThrough.setMonth(generateThrough.getMonth() + 2);
@@ -1453,7 +1473,7 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
     generateThrough.setMonth(generateThrough.getMonth() + 1);
 
     const existingKeys = new Set(
-      keptPayments.map((p) => `${p.studentId}__${p.subject}__${p.dueDate}`),
+      keptPayments.map((p) => `${p.studentId}__${p.subject}__${p.rule}__${p.month}`),
     );
     const rebuilt: Payment[] = [];
     for (const student of get().students) {
@@ -1478,24 +1498,22 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
     }
 
     // Guard the DB constraints before writing:
-    //  - unique(student_id, subject, due_date): two enrollments of the same
-    //    subject (e.g. different tracks) can generate rows sharing the
-    //    natural key. Collapse to one row per key, keeping the most settled.
+    //  - unique(student_id, subject, due_date): the ledger keeps exactly ONE
+    //    row per (rule, month) — a dueDate determines its month, so
+    //    collapsing by rule + month also removes every dueDate collision.
+    //    Keep the most settled row.
     //  - check (amount_due > 0): a zero/negative amount (free join month,
     //    zero price) must never be inserted.
     const deduped = new Map<string, Payment>();
     for (const payment of rebuilt) {
       if (payment.amountDue <= 0) continue;
-      const key = `${payment.studentId}__${payment.subject}__${payment.dueDate}`;
+      const key = `${payment.studentId}__${payment.subject}__${payment.rule}__${payment.month}`;
       const current = deduped.get(key);
       if (!current) {
         deduped.set(key, payment);
       } else {
-        const keep =
-          (payment.isPaid ? 1 : 0) - (current.isPaid ? 1 : 0) !== 0
-            ? payment.isPaid
-            : (payment.amountPaid ?? 0) >= (current.amountPaid ?? 0);
-        deduped.set(key, keep ? payment : current);
+        const keep = isMoreSettledPayment(payment, current) ? payment : current;
+        deduped.set(key, keep);
       }
     }
     const rebuiltRows = [...deduped.values()];
@@ -1724,10 +1742,10 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
   },
   hydratePayments: (payments) => {
     // Self-heal: collapse duplicate rows that share a logical installment
-    // identity (`studentId__subject__dueDate`) — leftovers from loads that
-    // generated before hydration — and delete the surplus docs from
-    // Firestore. Idempotent: a clean ledger is returned untouched and this
-    // schedules no writes.
+    // identity (`studentId__subject__month`) — leftovers from loads that
+    // generated before hydration, or a re-anchor's re-dated duplicate — and
+    // delete the surplus docs from Firestore. Idempotent: a clean ledger is
+    // returned untouched and this schedules no writes.
     const { kept, duplicateIds } = dedupePayments(payments);
     if (duplicateIds.length > 0) void deletePaymentsBatchDoc(duplicateIds);
 

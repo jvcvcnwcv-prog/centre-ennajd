@@ -6,6 +6,7 @@ import {
   applyCreditWaterfall,
   buildDeliveredDatesContext,
   computeExpectedMonthAmount,
+  dedupePayments,
   earliestValidAttendanceDate,
   generateRuleBSchedule,
   generateScheduleFor,
@@ -576,6 +577,28 @@ describe("reconcilePaymentAmounts", () => {
     );
     expect(patches[0].amountDue).toBe(300);
   });
+
+  it("patches only the keeper of a duplicated month — never the surplus rows", () => {
+    // A moved anchor left TWO January rows (the 438 = 219 + 219 leak shape):
+    // the pristine generator row and a re-dated duplicate. Only ONE row may
+    // be patched — double-patching would keep the ledger inflated at 800
+    // until a collapse pass runs.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 400, true),
+    ];
+    const patches = reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices);
+    expect(patches).toHaveLength(1);
+    // The settled row wins the keeper race; its dueDate moves to the
+    // engine's join-month date, its own amountPaid is carried as-is.
+    expect(patches[0]).toEqual({
+      id: "p2",
+      amountDue: 400,
+      dueDate: "2025-01-01",
+      amountPaid: 400,
+      isPaid: true,
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -612,7 +635,13 @@ describe("reconcileRuleALedger", () => {
     const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
     expect(result.delete).toEqual([]);
     expect(result.update).toEqual([
-      { id: "p1", amountDue: 400, isPaid: false }, // 150 < 400
+      {
+        id: "p1",
+        amountDue: 400,
+        dueDate: "2025-01-01", // join month → the anchor date itself
+        amountPaid: 150, // consolidated group credit (single row here)
+        isPaid: false, // 150 < 400
+      },
     ]);
   });
 
@@ -709,7 +738,15 @@ describe("reconcileRuleALedger", () => {
       prices,
     );
     expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([{ id: "p1", amountDue: 300, isPaid: false }]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 300,
+        dueDate: "2025-01-15", // join month → anchor date
+        amountPaid: 0,
+        isPaid: false,
+      },
+    ]);
   });
 
   it("uses the attendance anchor when attendance records are present", () => {
@@ -739,7 +776,15 @@ describe("reconcileRuleALedger", () => {
       "2025-01-31",
     );
     expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([{ id: "p1", amountDue: 400, isPaid: false }]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400,
+        dueDate: "2025-01-08", // re-anchored join month → new anchor date
+        amountPaid: 0,
+        isPaid: false,
+      },
+    ]);
   });
 
   it("ignores an ABSENT record and keeps the enrollment anchor", () => {
@@ -761,7 +806,130 @@ describe("reconcileRuleALedger", () => {
       "2025-01-31",
     );
     expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([{ id: "p1", amountDue: 300, isPaid: false }]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 300,
+        dueDate: "2025-01-15",
+        amountPaid: 0,
+        isPaid: false,
+      },
+    ]);
+  });
+
+  // -------------------------------------------------------------------------
+  // ONE charge per month — collapse duplicates (the 438 = 219 + 219 fix)
+  // -------------------------------------------------------------------------
+
+  it("collapses two same-month rows into ONE engine-dated row and pools credit", () => {
+    // The daily sync used to mint a second January row when the attendance
+    // anchor moved (dedupe key was dueDate). The report matrix then summed
+    // both charges. Reconcile must keep exactly ONE row, re-date it onto the
+    // engine's join-month date, and consolidate the group's paid credit so
+    // no payment progress is lost.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 250, false),
+      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 150, false),
+    ];
+    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
+
+    // The surplus row is reported for deletion...
+    expect(result.delete).toEqual(["p2"]);
+    // ...and the keeper absorbs the group's credit: 250 + 150 = 400 → paid.
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400,
+        dueDate: "2025-01-01",
+        amountPaid: 400,
+        isPaid: true,
+      },
+    ]);
+
+    // Applying the patch must leave exactly one row for the month.
+    const survivors = payments
+      .filter((p) => !result.delete.includes(p.id))
+      .map((p) => (p.id === result.update[0].id ? { ...p, ...result.update[0] } : p));
+    expect(survivors).toHaveLength(1);
+    expect(survivors[0].amountDue).toBe(400);
+    expect(isPaymentFullyPaid(survivors[0])).toBe(true);
+  });
+
+  it("deletes the WHOLE group when the month stops being billable", () => {
+    // Both duplicates of a now-non-billable month are stale — deleting only
+    // one would leave a ghost charge on the ledger.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 400, true),
+      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      [], // timetable removed → the engine emits nothing for January
+      prices,
+    );
+    expect(result.update).toEqual([]);
+    expect(result.delete.sort()).toEqual(["p1", "p2"]);
+  });
+
+  it("re-dates the keeper onto the anchor when the anchor moved", () => {
+    // Enrollment says Jan 1, but attendance proves the student started
+    // Jan 8 → the join month's dueDate becomes the anchor (Jan 8), and the
+    // row still sitting on the stale date is re-dated rather than duplicated.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const attendance: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-3", "2025-01-08"),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      attendance,
+      "2025-01-31",
+    );
+    expect(result.delete).toEqual([]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400, // Jan 8 + 15 + 22 + 29 = 4 sessions
+        dueDate: "2025-01-08",
+        amountPaid: 0,
+        isPaid: false,
+      },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dedupePayments — hydration self-heal (one row per student__subject__month)
+// ---------------------------------------------------------------------------
+
+describe("dedupePayments", () => {
+  it("collapses same-month duplicates regardless of dueDate", () => {
+    // A re-dated duplicate shares the calendar MONTH even when its dueDate
+    // moved — keying on the month is what lets hydration wipe DB duplicates.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 400, true),
+      makePayment("p3", STUDENT_ID, "Math", "2025-02-01", 400, 0, false),
+    ];
+    const result = dedupePayments(payments);
+    expect(result.kept.map((p) => p.id).sort()).toEqual(["p2", "p3"]);
+    expect(result.duplicateIds).toEqual(["p1"]); // the settled row wins
+  });
+
+  it("returns the ledger untouched when it is already clean", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 400, 0, false),
+    ];
+    expect(dedupePayments(payments)).toEqual({
+      kept: payments,
+      duplicateIds: [],
+    });
   });
 });
 

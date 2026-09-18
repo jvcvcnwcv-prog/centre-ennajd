@@ -372,6 +372,142 @@ function generateInstallmentsForStudent(
 }
 
 /**
+ * Single-write credit waterfall — the shared commit path for
+ * `recordPartialPayment` (per-subject) and `applyInitialTuitionPayment`
+ * (cross-subject, `subject === null`).
+ *
+ * The race this exists to kill: the old paths did TWO sequential `payments`
+ * writes — an upsert of the freshly-generated installments (amountPaid: 0),
+ * then a per-id `updatePaymentsBatchDoc` applying the credit waterfall.
+ * Supabase realtime echoes both asynchronously; when WRITE 1's echo lands
+ * AFTER WRITE 2's optimistic `set`, the store is reverted to the
+ * pre-waterfall snapshot (October flips back to 0/red) even though the DB
+ * already holds the credited amount. Collapsing both into ONE upsert means
+ * one echo — and since the store holds byte-identical content to what that
+ * echo delivers, `stableFingerprint` / `replaceIfChanged` recognise it as a
+ * no-op and keep the current reference.
+ *
+ * Nothing touches the DB until the FULLY-waterfalled final array is computed
+ * in memory. `applyCreditWaterfall` runs over the LOCAL union of the previous
+ * ledger + the caller-generated rows, and the credit patches are merged onto
+ * the generated rows IN PLACE — never appended as copies, which would put two
+ * rows sharing one id in a single batch and trip PostgREST's "cannot affect
+ * row a second time". The final array is deduped by id via a Map so each id
+ * ships exactly once.
+ *
+ * `remaining` (unabsorbed surplus) is computed UNCONDITIONALLY and always
+ * parked in `advanceBalance` when positive. The old paths only parked it
+ * inside their `anyChanged` branch (and `applyInitialTuitionPayment` early-
+ * returned `if (!anyChanged) return`), so when every installment was already
+ * fully paid the ENTIRE payment was silently lost.
+ *
+ * `advanceBalance` stays a deliberate second write — it targets the
+ * `students` table (a different realtime channel), so its echo cannot clobber
+ * the payments ledger. Optimistic throughout: the store is set first and
+ * rolled back to the snapshotted slices on failure.
+ */
+async function commitWaterfallSingleWrite(args: {
+  studentId: string;
+  /** null = cross-subject (applyInitialTuitionPayment). */
+  subject: Subject | null;
+  credit: number;
+  asOfKey: string;
+  updatedAt: string;
+  /** Pre-computed by the caller, NOT yet in the store. */
+  generated: Payment[];
+  previousPayments: Payment[];
+  previousStudents: Student[];
+  /** applyInitialTuitionPayment rethrows so its caller stays open. */
+  rethrow?: boolean;
+}): Promise<void> {
+  const {
+    studentId,
+    subject,
+    credit,
+    asOfKey,
+    updatedAt,
+    generated,
+    previousPayments,
+    previousStudents,
+    rethrow,
+  } = args;
+
+  // 1. Pure local union of the previous ledger + the freshly-generated rows.
+  // No intermediate `set` → nothing for a late echo to clobber.
+  const paymentsNow = [...previousPayments, ...generated];
+
+  // 2. Run the waterfall over the union (dueDate-ascending gap-filling).
+  const { updated, remaining } = applyCreditWaterfall(
+    paymentsNow,
+    studentId,
+    subject,
+    Math.round(credit),
+    asOfKey,
+    updatedAt,
+  );
+
+  // 3-4. Dedup-by-id final payload. Generated rows carry their credit patch
+  // IN PLACE; existing changed rows follow. Belt-and-braces Map dedup guards
+  // against a generated id ever colliding with an existing one.
+  const patchById = new Map(updated.map((p) => [p.id, p]));
+  const generatedIds = new Set(generated.map((p) => p.id));
+  const finalRows = new Map<string, Payment>(
+    [
+      ...generated.map((p) => patchById.get(p.id) ?? p),
+      ...updated.filter((p) => !generatedIds.has(p.id)),
+    ].map((p) => [p.id, p]),
+  );
+  const rows = [...finalRows.values()];
+
+  // 5. Nothing happened — no gaps, no generation, no surplus. No writes at
+  // all, wallet intact.
+  if (rows.length === 0 && remaining === 0) return;
+
+  // 6. ONE optimistic `set`: patch the credited existing rows, append the
+  // (possibly credited) generated rows, and park the surplus — computed
+  // unconditionally, fixing the latent lost-credit bug.
+  const prevBalance =
+    previousStudents.find((s) => s.id === studentId)?.advanceBalance ?? 0;
+  const nextBalance = prevBalance + remaining;
+  const generatedRows = rows.filter((p) => generatedIds.has(p.id));
+  useEnnajdState.setState((s) => ({
+    payments: [
+      ...s.payments.map((p) => patchById.get(p.id) ?? p),
+      ...generatedRows,
+    ],
+    students:
+      remaining > 0
+        ? s.students.map((st) =>
+            st.id === studentId
+              ? { ...st, advanceBalance: nextBalance }
+              : st,
+          )
+        : s.students,
+  }));
+
+  try {
+    // 7. The ONLY payments write. Its echo can only re-deliver content the
+    // store already holds.
+    if (rows.length > 0) {
+      await upsertPaymentsBatchDoc(rows);
+    }
+    // 8. Separate table → separate realtime channel; carries the correct
+    // final balance, computed once.
+    if (remaining > 0) {
+      await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+    }
+  } catch (err) {
+    // 9. Roll back both slices, warn, and rethrow when the caller asked.
+    useEnnajdState.setState({
+      payments: previousPayments,
+      students: previousStudents,
+    });
+    toast.error(t("paymentSaveFailed"));
+    if (rethrow) throw err;
+  }
+}
+
+/**
  * Pure reactive-layer guard for `hydrate*` actions. `onSnapshot` fires on
  * every local Firestore write — including a mirrored echo of our own write —
  * and hands us freshly-mapped arrays. If the mapped contents are identical to
@@ -1196,65 +1332,20 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       (p) => p.subject === subject,
     );
 
-    // Generated installments + credit patches are committed inside ONE try so
-    // a generation failure rolls back both (previously the generation upsert
-    // was fire-and-forget, leaving phantom rows the amount_paid patches then
-    // hit on non-existent records).
-    try {
-      if (filteredGenerated.length > 0) {
-        set((s) => ({ payments: [...s.payments, ...filteredGenerated] }));
-        await upsertPaymentsBatchDoc(filteredGenerated);
-      }
-
-      // Re-read after generation so the waterfall sees the newly-created
-      // future installments.
-      const paymentsNow = get().payments;
-
-      // Apply the credit waterfall across ALL non-fully-paid installments for
-      // this student+subject, in dueDate-ascending order — due AND future.
-      // Surplus that can't be absorbed rolls forward month by month; any still
-      // unabsorbed credit becomes advanceBalance on the student record.
-      // With session-based pricing the installment amounts are exact, so the
-      // waterfall is plain dueDate-ascending gap-filling.
-      const { updated, remaining, anyChanged } = applyCreditWaterfall(
-        paymentsNow,
-        studentId,
-        subject,
-        Math.round(amount),
-        asOfKey,
-        updatedAt,
-      );
-
-      if (anyChanged) {
-        const nextById = new Map(updated.map((p) => [p.id, p]));
-        set((state) => ({
-          payments: state.payments.map((p) => nextById.get(p.id) ?? p),
-        }));
-
-        const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
-          (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
-        );
-
-        await updatePaymentsBatchDoc(patches);
-
-        // Surplus remains → carry it forward as advanceBalance.
-        if (remaining > 0) {
-          const prevBalance = student.advanceBalance ?? 0;
-          const nextBalance = prevBalance + remaining;
-          set((state) => ({
-            students: state.students.map((s) =>
-              s.id === studentId
-                ? { ...s, advanceBalance: nextBalance }
-                : s,
-            ),
-          }));
-          await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
-        }
-      }
-    } catch (err) {
-      set({ payments: previousPayments, students: previousStudents });
-      toast.error(t("paymentSaveFailed"));
-    }
+    // Single-write waterfall: the credit is merged onto the final rows fully
+    // in memory and committed in ONE upsert, so the realtime echo can only
+    // ever re-deliver the waterfalled state — never a pre-credit snapshot
+    // that flips a credited month back to red.
+    await commitWaterfallSingleWrite({
+      studentId,
+      subject,
+      credit: amount,
+      asOfKey,
+      updatedAt,
+      generated: filteredGenerated,
+      previousPayments,
+      previousStudents,
+    });
   },
 
 /**
@@ -1409,65 +1500,23 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
       updatedAt,
     );
 
-    try {
-      // Persist generated installments BEFORE running the waterfall so the
-      // DB and local state stay consistent. Awaited (not void-fired) so a
-      // failure rolls back both the generated rows and the credit patches.
-      if (generated.length > 0) {
-        set((s) => ({ payments: [...s.payments, ...generated] }));
-        await upsertPaymentsBatchDoc(generated);
-      }
-
-      // Re-read after generation so the waterfall sees the newly-created
-      // installments across all subjects.
-      const paymentsNow = get().payments;
-
-      // Cross-subject waterfall: scan every non-fully-paid installment
-      // (subject=null), sorted by dueDate ascending. Surplus that can't be
-      // absorbed becomes advanceBalance on the student record.
-      const { updated, remaining, anyChanged } = applyCreditWaterfall(
-        paymentsNow,
-        studentId,
-        null, // cross-subject
-        Math.round(totalPaid),
-        asOfKey,
-        updatedAt,
-      );
-
-      if (!anyChanged) return;
-
-      const nextById = new Map(updated.map((p) => [p.id, p]));
-      const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = updated.map(
-        (p) => ({ id: p.id, amountPaid: p.amountPaid, isPaid: p.isPaid, updatedAt }),
-      );
-
-      set((state) => ({
-        payments: state.payments.map((p) => nextById.get(p.id) ?? p),
-      }));
-
-      let commitAdvanceBalance = false;
-      const prevBalance = student.advanceBalance ?? 0;
-      const nextBalance = prevBalance + remaining;
-      if (remaining > 0) {
-        set((state) => ({
-          students: state.students.map((s) =>
-            s.id === studentId
-              ? { ...s, advanceBalance: nextBalance }
-              : s,
-          ),
-        }));
-        commitAdvanceBalance = true;
-      }
-
-      await updatePaymentsBatchDoc(patches);
-      if (commitAdvanceBalance) {
-        await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
-      }
-    } catch (err) {
-      set({ payments: previousPayments, students: previousStudents });
-      toast.error(t("paymentSaveFailed"));
-      throw err;
-    }
+    // Single-write cross-subject waterfall: the credit is merged onto the
+    // final rows fully in memory and committed in ONE upsert, so the realtime
+    // echo can only re-deliver the waterfalled state. The old early
+    // `if (!anyChanged) return` is gone — the helper's own empty-payload guard
+    // replaces it, and unabsorbed surplus now always reaches advanceBalance
+    // instead of being silently dropped when every installment was paid.
+    await commitWaterfallSingleWrite({
+      studentId,
+      subject: null, // cross-subject
+      credit: totalPaid,
+      asOfKey,
+      updatedAt,
+      generated,
+      previousPayments,
+      previousStudents,
+      rethrow: true,
+    });
   },
 
   /**

@@ -13,6 +13,7 @@ import type {
   PriceEntry,
   Session,
   Student,
+  Subject,
 } from "../types/ennajd";
 
 // Fixed clock so the "now + 1 month" generation horizon is deterministic.
@@ -193,6 +194,29 @@ function payment(
     amountPaid,
     isHalfMonth: false,
     rule,
+    updatedAt: "2026-09-15T00:00:00.000Z",
+  };
+}
+
+/** Same as `payment()` but for an arbitrary subject (cross-subject tests). */
+function paymentFor(
+  subject: Subject,
+  id: string,
+  dueDate: string,
+  amountDue: number,
+  amountPaid = 0,
+): Payment {
+  return {
+    id,
+    studentId: STUDENT_ID,
+    subject,
+    dueDate,
+    month: dueDate.slice(0, 7),
+    isPaid: amountPaid >= amountDue,
+    amountDue,
+    amountPaid,
+    isHalfMonth: false,
+    rule: "A",
     updatedAt: "2026-09-15T00:00:00.000Z",
   };
 }
@@ -589,6 +613,212 @@ describe("recordPartialPayment — waterfall", () => {
       useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
         .advanceBalance ?? 0,
     ).toBe(0);
+
+    // SINGLE-WRITE CONTRACT — the realtime echo race fix. The whole waterfall
+    // commits as exactly ONE payments write; there is no second per-id update
+    // whose echo could land after the optimistic set and revert October to 0.
+    const db = await import("@/lib/dbServices");
+    expect(db.upsertPaymentsBatchDoc).toHaveBeenCalledTimes(1);
+    expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
+
+    // The October row inside that ONE payload already carries amountPaid 175 —
+    // so the echo can only ever re-deliver 175, never the pre-credit 0.
+    const oct = (await upsertedRows()).find((p) => p.id === "oct");
+    expect(oct).toBeDefined();
+    expect(oct!.amountPaid).toBe(175);
+    expect(oct!.isPaid).toBe(false);
+    // No id ships twice in the batch (PostgREST "cannot affect row a second
+    // time"); the credit is merged onto the rows, never appended as a copy.
+    const ids = (await upsertedRows()).map((p) => p.id);
+    expect(ids).toEqual([...new Set(ids)]);
+  });
+
+  it("parks surplus in advanceBalance when every installment is fully paid", async () => {
+    // Latent lost-credit bug: with no gap anywhere (all installments through
+    // the generation horizon are settled), the credit can be absorbed by
+    // nothing and must land in the wallet. The old two-write path only parked
+    // surplus inside its `anyChanged` branch — false here — and silently
+    // dropped the ENTIRE payment.
+    seedRuleALedger([
+      payment("sept", "2026-09-15", 350, "A", 350),
+      payment("oct", "2026-10-01", 350, "A", 350),
+      payment("nov", "2026-11-01", 350, "A", 350),
+      payment("dec", "2026-12-01", 350, "A", 350),
+    ]);
+
+    await useEnnajdState
+      .getState()
+      .recordPartialPayment(STUDENT_ID, "Math", 200, new Date("2026-10-15T12:00:00"));
+
+    const db = await import("@/lib/dbServices");
+    expect(walletBalance()).toBe(200);
+    // Nothing was generated and no credit landed → the wallet write is the
+    // ONLY write. No payments echo at all, so nothing can revert the store.
+    expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
+      STUDENT_ID,
+      200,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------//
+// applyInitialTuitionPayment — the create-time cross-subject waterfall. Same
+// single-write contract as recordPartialPayment: the fully-waterfalled rows
+// ship in ONE upsert (credit merged in place, never appended as copies), and
+// unabsorbed surplus always reaches advanceBalance — the old path early-
+// returned `if (!anyChanged)` and dropped the payment when nothing could
+// absorb it.
+// ---------------------------------------------------------------------------//
+
+// A Monday PC slot alongside the Tue/Thu Math slots, so the student is
+// enrolled in two Rule A subjects and a single credit can spill across them.
+const SESSION_PC: Session = {
+  id: "session-pc-mon",
+  subject: "PC",
+  level: "T.C",
+  track: null,
+  groupType: "Large",
+  dayOfWeek: 1,
+  startTime: "16:00",
+  endTime: "18:00",
+  kind: "recurring",
+  date: null,
+};
+
+const PRICE_PC: PriceEntry = {
+  id: "price-pc-tc",
+  level: "T.C",
+  subject: "PC",
+  track: null,
+  groupType: "Large",
+  price: 350,
+};
+
+/**
+ * Hydrated ledger for a student enrolled in BOTH Math and PC (both T.C Large,
+ * Rule A, 350 MAD/month from the 15/09 enrollment anchor).
+ */
+function seedCrossSubjectLedger(payments: Payment[]) {
+  resetStore();
+  useEnnajdState.setState({
+    students: [
+      {
+        ...STUDENT,
+        enrollments: [
+          { subject: "Math", track: null, groupType: "Large", enrolledAt: "2026-09-15T12:00:00.000Z" },
+          { subject: "PC", track: null, groupType: "Large", enrolledAt: "2026-09-15T12:00:00.000Z" },
+        ],
+      },
+    ],
+    sessions: [...SESSIONS, SESSION_PC],
+    prices: [...PRICES, PRICE_PC],
+    payments,
+    hasSyncedPayments: true,
+    lastPaymentsSyncDateKey: TODAY_KEY,
+  });
+}
+
+describe("applyInitialTuitionPayment — single-write cross-subject waterfall", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetStore();
+    vi.clearAllMocks();
+  });
+
+  it("spills across subjects in ONE upsert, no per-id update", async () => {
+    // Both September installments are unpaid. A 500 payment fills Math (350)
+    // and spills the remaining 150 onto PC — the cross-subject spill.
+    seedCrossSubjectLedger([
+      paymentFor("Math", "m-sept", "2026-09-15", 350),
+      paymentFor("PC", "p-sept", "2026-09-15", 350),
+    ]);
+
+    await useEnnajdState
+      .getState()
+      .applyInitialTuitionPayment(STUDENT_ID, 500, new Date("2026-10-15T12:00:00"));
+
+    const db = await import("@/lib/dbServices");
+
+    // Exactly ONE payments write; the per-id update whose echo used to revert
+    // the credit is gone entirely.
+    expect(db.upsertPaymentsBatchDoc).toHaveBeenCalledTimes(1);
+    expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
+
+    // The credited EXISTING rows ship as full rows already carrying their
+    // credit — the echo can only re-deliver these exact amounts.
+    const byId = new Map((await upsertedRows()).map((p) => [p.id, p]));
+    expect(byId.get("m-sept")!.amountPaid).toBe(350);
+    expect(byId.get("p-sept")!.amountPaid).toBe(150);
+    // No id ships twice in the single batch.
+    const ids = (await upsertedRows()).map((p) => p.id);
+    expect(ids).toEqual([...new Set(ids)]);
+
+    // The store holds the same values as the payload it just shipped.
+    const ledger = useEnnajdState.getState().payments;
+    expect(ledger.find((p) => p.id === "m-sept")!.amountPaid).toBe(350);
+    expect(ledger.find((p) => p.id === "p-sept")!.amountPaid).toBe(150);
+
+    // Fully absorbed → the wallet was never touched.
+    expect(db.updateStudentAdvanceBalanceDoc).not.toHaveBeenCalled();
+    expect(walletBalance()).toBe(0);
+  });
+
+  it("parks unabsorbed surplus in advanceBalance (latent lost-credit fix)", async () => {
+    // Every installment through the generation horizon is already settled, so
+    // the waterfall has no gap and the whole payment must survive as surplus.
+    // The old path's `if (!anyChanged) return` dropped it without writing the
+    // wallet at all.
+    seedCrossSubjectLedger([
+      paymentFor("Math", "m-sept", "2026-09-15", 350, 350),
+      paymentFor("Math", "m-oct", "2026-10-01", 350, 350),
+      paymentFor("Math", "m-nov", "2026-11-01", 350, 350),
+      paymentFor("Math", "m-dec", "2026-12-01", 350, 350),
+      paymentFor("PC", "p-sept", "2026-09-15", 350, 350),
+      paymentFor("PC", "p-oct", "2026-10-01", 350, 350),
+      paymentFor("PC", "p-nov", "2026-11-01", 350, 350),
+      paymentFor("PC", "p-dec", "2026-12-01", 350, 350),
+    ]);
+
+    await useEnnajdState
+      .getState()
+      .applyInitialTuitionPayment(STUDENT_ID, 200, new Date("2026-10-15T12:00:00"));
+
+    const db = await import("@/lib/dbServices");
+    expect(walletBalance()).toBe(200);
+    // Nothing generated and no credit landed → the wallet write is the ONLY
+    // write, so no payments echo can revert the store.
+    expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
+      STUDENT_ID,
+      200,
+    );
+  });
+
+  it("reverts the ledger and rethrows when the write fails", async () => {
+    seedCrossSubjectLedger([
+      paymentFor("Math", "m-sept", "2026-09-15", 350),
+      paymentFor("PC", "p-sept", "2026-09-15", 350),
+    ]);
+    mockState.failNextPaymentBatch = true;
+
+    // The caller (StudentFormSheet) relies on the rethrow to stay open.
+    await expect(
+      useEnnajdState
+        .getState()
+        .applyInitialTuitionPayment(STUDENT_ID, 500, new Date("2026-10-15T12:00:00")),
+    ).rejects.toThrow("simulated offline failure");
+
+    // Both optimistic slices rolled back to the snapshot.
+    expect(useEnnajdState.getState().payments.map((p) => p.id)).toEqual([
+      "m-sept",
+      "p-sept",
+    ]);
+    expect(walletBalance()).toBe(0);
+    expect(toast.error).toHaveBeenCalled();
   });
 });
 

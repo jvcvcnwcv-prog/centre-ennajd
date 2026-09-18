@@ -831,6 +831,10 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       state.payments.map((p) => `${p.studentId}__${p.subject}__${p.rule}__${p.month}`),
     );
     const newPayments: Payment[] = [];
+    // Advance-credit patches on EXISTING ledger rows — persisted via per-id
+    // UPDATE after the reconcile pass, so they never share an id with the
+    // rows in `newPayments` inside the batch upsert.
+    const creditPatches: Array<Pick<Payment, "id"> & Partial<Payment>> = [];
     const advanceBalanceUpdates: Array<{
       studentId: string;
       nextBalance: number;
@@ -850,7 +854,6 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         existingKeys,
         now.toISOString(),
       );
-      newPayments.push(...studentGenerated);
 
       // CONSUME ADVANCE CREDIT: apply any existing advanceBalance to the
       // earliest non-fully-paid installments across all subjects, sorted by
@@ -871,16 +874,37 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         );
 
         if (updated.length > 0) {
-          // Merge advance-credit patches into the outgoing batch.
-          for (const u of updated) newPayments.push(u);
-          // Deduct consumed credit from the student's advanceBalance.
+          // Apply the credit IN PLACE, never by appending: a patched row is
+          // either an EXISTING ledger row or one of the generated rows about
+          // to be appended. Appending full copies duplicates ids, which both
+          // breaks the one-row-per-month invariant (the red panel then sums
+          // the stale and the credited copy) and puts two rows sharing a
+          // primary key in the batch upsert — PostgREST rejects that with
+          // "cannot affect row a second time", rolling back the WHOLE commit
+          // and stranding the carryover in the wallet (Oct then re-shows its
+          // full amount in red, ignoring the credit).
+          const patchById = new Map(updated.map((p) => [p.id, p]));
           set((s) => ({
+            payments: s.payments.map((p) => patchById.get(p.id) ?? p),
             students: s.students.map((s2) =>
               s2.id === student.id
                 ? { ...s2, advanceBalance: remaining }
                 : s2,
             ),
           }));
+          // The generated rows ride along in newPayments — carry their patch
+          // onto the copy that actually gets appended + upserted.
+          for (let i = 0; i < studentGenerated.length; i++) {
+            const patched = patchById.get(studentGenerated[i].id);
+            if (patched) studentGenerated[i] = patched;
+          }
+          // Persist the credit on EXISTING rows via per-id UPDATE (same path
+          // recordPartialPayment uses) — the batch upsert would duplicate
+          // their ids. Generated rows are persisted through newPayments.
+          const generatedIds = new Set(studentGenerated.map((p) => p.id));
+          for (const u of updated) {
+            if (!generatedIds.has(u.id)) creditPatches.push(u);
+          }
           // Collect for persistence — the missing write that used to lose
           // carried-forward credit on refresh.
           advanceBalanceUpdates.push({
@@ -889,6 +913,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
           });
         }
       }
+
+      newPayments.push(...studentGenerated);
     }
 
     // SELF-HEAL: make the Rule A ledger AUTHORITATIVE. Beyond patching rows
@@ -952,7 +978,12 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       }));
     }
 
-    if (newPayments.length === 0 && reconciledPayments.length === 0 && deletedPaymentIds.length === 0) {
+    if (
+      newPayments.length === 0 &&
+      reconciledPayments.length === 0 &&
+      deletedPaymentIds.length === 0 &&
+      creditPatches.length === 0
+    ) {
       return;
     }
 
@@ -972,6 +1003,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       const upsertRows = [...newPayments, ...reconciledPayments];
       if (upsertRows.length > 0) {
         await upsertPaymentsBatchDoc(upsertRows);
+      }
+      // Credit applied to existing rows by the advance-consumption pass —
+      // patched per-id so it never collides with the upsert batch above.
+      if (creditPatches.length > 0) {
+        await updatePaymentsBatchDoc(creditPatches);
       }
       for (const { studentId, nextBalance } of advanceBalanceUpdates) {
         // The missing write that used to lose carried-forward credit on

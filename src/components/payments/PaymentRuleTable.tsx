@@ -214,13 +214,13 @@ export function PaymentRuleTable({
                     <span
                       className={cn(
                         "font-semibold",
-                        row.isPartiallyPaid && "text-accent-foreground",
+                        row.isPartiallyPaid && "text-success",
                       )}
                     >
                       {row.totalRemaining} MAD
                     </span>
                     {row.isPartiallyPaid && (
-                      <span className="ms-1.5 whitespace-nowrap text-xs font-bold text-accent-foreground">
+                      <span className="ms-1.5 whitespace-nowrap text-xs font-bold text-success">
                         · {t("paidSoFar")} {row.totalAmountPaid} MAD
                       </span>
                     )}
@@ -345,14 +345,14 @@ export function PaymentRuleTable({
                 <span
                   className={cn(
                     "ms-auto font-semibold",
-                    row.isPartiallyPaid && "text-accent-foreground",
+                    row.isPartiallyPaid && "text-success",
                   )}
                 >
                   {row.totalRemaining} MAD
                 </span>
               </div>
               {row.isPartiallyPaid && (
-                <p className="mt-1 text-xs font-bold text-accent-foreground">
+                <p className="mt-1 text-xs font-bold text-success">
                   {t("paidSoFar")} : {row.totalAmountPaid} MAD ·{" "}
                   {t("remainingAmount")} : {row.totalRemaining} MAD
                 </p>

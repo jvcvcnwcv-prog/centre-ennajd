@@ -75,6 +75,31 @@ const PRICES: PriceEntry[] = [
   },
 ];
 
+// 2Bac s.x Small — Rule B territory: a fixed 500 MAD/month rolling cycle
+// anchored on the enrollment date. Deterministic (no session-count math), so
+// the wallet-carryover tests below can predict exactly which months exist.
+const SESSION_2BAC: Session = {
+  id: "session-math-2bac",
+  subject: "Math",
+  level: "2Bac",
+  track: "s.x",
+  groupType: "Small",
+  dayOfWeek: 2,
+  startTime: "16:00",
+  endTime: "18:00",
+  kind: "recurring",
+  date: null,
+};
+
+const PRICE_2BAC: PriceEntry = {
+  id: "price-math-2bac",
+  level: "2Bac",
+  subject: "Math",
+  track: "s.x",
+  groupType: "Small",
+  price: 500,
+};
+
 // Shared mock state — lets a single test flip a doc write to a rejection.
 const mockState = vi.hoisted(() => ({
   failNextPaymentBatch: false,
@@ -188,8 +213,12 @@ function ledgerByMonth(): Map<string, Payment> {
 /** Every payment id handed to `deletePaymentsBatchDoc` so far in this test. */
 async function deletePaymentsBatchDocIds(): Promise<string[]> {
   const db = await import("@/lib/dbServices");
-  const calls = vi.mocked(db.deletePaymentsBatchDoc).mock.calls as unknown as string[][];
-  return calls.flat();
+  // `mock.calls[i][0]` is the FIRST ARGUMENT of call i (the ids array) —
+  // flattening one level of `calls` instead would leave an extra nesting and
+  // make every `toContain` assertion silently pass on the wrong shape.
+  return vi
+    .mocked(db.deletePaymentsBatchDoc)
+    .mock.calls.flatMap((call) => call[0]);
 }
 
 describe("reactive ledger — markAttendance trigger", () => {
@@ -560,6 +589,238 @@ describe("recordPartialPayment — waterfall", () => {
       useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
         .advanceBalance ?? 0,
     ).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------//
+// syncPayments — the daily self-heal, and the wallet (advanceBalance)
+// carryover regression. Credit parked in the wallet from an earlier
+// over-payment must land on the next month's installment, applied IN PLACE.
+// The old code appended full credited COPIES alongside the rows they patched:
+// two ledger rows sharing one id broke the one-row-per-month invariant (the
+// red panel then summed the stale copy AND the credited one) and put two rows
+// sharing a primary key in a single batch upsert — PostgREST rejects that
+// with "cannot affect row a second time", rolling back the WHOLE commit and
+// stranding the carryover in the wallet (the next month then re-showed its
+// full amount in red, ignoring the credit).
+// ---------------------------------------------------------------------------//
+
+/** Wallet credit carried into the sync (MAD). */
+const WALLET = 200;
+
+/**
+ * Hydrated Rule B ledger (2Bac s.x Small, 500 MAD/month from the 15/09
+ * enrollment). `force` is used only to step past the module-level
+ * once-per-minute + once-per-calendar-day throttles — the ledger logic
+ * itself is identical to the daily path.
+ */
+function seedWalletLedger(payments: Payment[], advanceBalance: number) {
+  resetStore();
+  useEnnajdState.setState({
+    students: [
+      {
+        ...STUDENT,
+        level: "2Bac",
+        track: "s.x",
+        enrollments: [
+          {
+            subject: "Math",
+            track: "s.x",
+            groupType: "Small",
+            enrolledAt: "2026-09-15T12:00:00.000Z",
+          },
+        ],
+        advanceBalance,
+      },
+    ],
+    sessions: [SESSION_2BAC],
+    prices: [PRICE_2BAC],
+    payments,
+    hasSyncedPayments: true,
+    // null so the once-per-calendar-day guard lets this sync run.
+    lastPaymentsSyncDateKey: null,
+  });
+}
+
+/** A Rule B installment: 500 MAD due on the 15th of `month`. */
+function ruleBPayment(
+  id: string,
+  month: string,
+  amountPaid = 0,
+): Payment {
+  return {
+    id,
+    studentId: STUDENT_ID,
+    subject: "Math",
+    dueDate: `${month}-15`,
+    month,
+    isPaid: amountPaid >= 500,
+    amountDue: 500,
+    amountPaid,
+    isHalfMonth: false,
+    rule: "B",
+    updatedAt: "2026-09-15T00:00:00.000Z",
+  };
+}
+
+/** The student's current wallet balance. */
+function walletBalance(): number {
+  return (
+    useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
+      .advanceBalance ?? 0
+  );
+}
+
+/** Every row handed to the batch upsert so far in this test. */
+async function upsertedRows(): Promise<Payment[]> {
+  const db = await import("@/lib/dbServices");
+  return vi
+    .mocked(db.upsertPaymentsBatchDoc)
+    .mock.calls.flatMap((call) => call[0]);
+}
+
+/** Every per-id patch handed to the batch update so far in this test. */
+async function patchedRows(): Promise<Array<{ id: string }>> {
+  const db = await import("@/lib/dbServices");
+  return vi
+    .mocked(db.updatePaymentsBatchDoc)
+    .mock.calls.flatMap((call) => call[0]);
+}
+
+/** Asserts the ledger keeps exactly one row per month — no duplicate ids. */
+function expectOneRowPerMonth() {
+  const months = useEnnajdState.getState().payments.map((p) => p.month);
+  const counts = new Map<string, number>();
+  for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
+  for (const count of counts.values()) expect(count).toBe(1);
+}
+
+describe("syncPayments — wallet carryover to the next month", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetStore();
+    vi.clearAllMocks();
+  });
+
+  it("lands the carried-over wallet on next month's NEW installment", async () => {
+    // Sept–Nov fully paid, 200 MAD parked in the wallet. The generation
+    // horizon is now + 1 month = mid-December, so the sync mints exactly one
+    // new row: December — and the wallet credit must land on it.
+    seedWalletLedger(
+      [
+        ruleBPayment("b-sept", "2026-09", 500),
+        ruleBPayment("b-oct", "2026-10", 500),
+        ruleBPayment("b-nov", "2026-11", 500),
+      ],
+      WALLET,
+    );
+
+    await useEnnajdState
+      .getState()
+      .syncPayments(new Date(NOW), { force: true });
+
+    const db = await import("@/lib/dbServices");
+
+    // December was generated and the 200 wallet credit landed on it.
+    const dec = ledgerByMonth().get("2026-12");
+    expect(dec).toBeDefined();
+    expect(dec!.amountDue).toBe(500);
+    expect(dec!.amountPaid).toBe(WALLET);
+    expect(dec!.isPaid).toBe(false);
+    // The wallet was drained — the carryover did not linger.
+    expect(walletBalance()).toBe(0);
+
+    // Exactly one row per month — the credit never minted a second December.
+    expectOneRowPerMonth();
+
+    // The generated + credited December row ships in the UPSERT batch...
+    const upserted = await upsertedRows();
+    expect(upserted.map((p) => p.id)).toEqual([dec!.id]);
+    // ...and NEVER ALSO in the per-id update batch. That double-write is what
+    // put two rows sharing a primary key in one commit and stranded the
+    // carryover in the wallet when the batch was rejected.
+    const patched = await patchedRows();
+    expect(patched.map((p) => p.id)).not.toContain(dec!.id);
+    // No id is written twice across the whole commit.
+    const writtenIds = [...upserted, ...patched].map((p) => p.id);
+    expect(writtenIds).toEqual([...new Set(writtenIds)]);
+
+    // The wallet drain itself was persisted — the missing write that used to
+    // lose carried-forward credit on refresh.
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
+      STUDENT_ID,
+      0,
+    );
+  });
+
+  it("patches an EXISTING row's credit per-id, never appends a duplicate", async () => {
+    // The full cycle through the horizon already exists, so syncPayments
+    // generates NOTHING — the 200 wallet credit must land on the existing
+    // unpaid December row through the per-id UPDATE path alone.
+    seedWalletLedger(
+      [
+        ruleBPayment("b-sept", "2026-09", 500),
+        ruleBPayment("b-oct", "2026-10", 500),
+        ruleBPayment("b-nov", "2026-11", 500),
+        ruleBPayment("b-dec", "2026-12", 0),
+      ],
+      WALLET,
+    );
+
+    await useEnnajdState
+      .getState()
+      .syncPayments(new Date(NOW), { force: true });
+
+    const db = await import("@/lib/dbServices");
+
+    // December kept its id and its amountDue — only amountPaid moved.
+    const dec = ledgerByMonth().get("2026-12");
+    expect(dec!.id).toBe("b-dec");
+    expect(dec!.amountDue).toBe(500);
+    expect(dec!.amountPaid).toBe(WALLET);
+    expect(dec!.isPaid).toBe(false);
+    expect(walletBalance()).toBe(0);
+
+    // NO new rows were generated → the upsert batch stays empty...
+    expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
+    // ...the credit ships as ONE per-id UPDATE on the existing row only.
+    expect(db.updatePaymentsBatchDoc).toHaveBeenCalledTimes(1);
+    const patches = vi.mocked(db.updatePaymentsBatchDoc).mock
+      .calls[0][0] as Array<{ id: string }>;
+    expect(patches.map((p) => p.id)).toEqual(["b-dec"]);
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
+      STUDENT_ID,
+      0,
+    );
+
+    expectOneRowPerMonth();
+  });
+
+  it("leaves the wallet intact when no installment can absorb it", async () => {
+    // Everything through the horizon is already fully paid, so the waterfall
+    // has no gap to fill: the carryover must survive untouched for the next
+    // sync, and nothing must be written.
+    seedWalletLedger(
+      [
+        ruleBPayment("b-sept", "2026-09", 500),
+        ruleBPayment("b-oct", "2026-10", 500),
+        ruleBPayment("b-nov", "2026-11", 500),
+        ruleBPayment("b-dec", "2026-12", 500),
+      ],
+      WALLET,
+    );
+
+    await useEnnajdState
+      .getState()
+      .syncPayments(new Date(NOW), { force: true });
+
+    const db = await import("@/lib/dbServices");
+    expect(walletBalance()).toBe(WALLET);
+    expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.updateStudentAdvanceBalanceDoc).not.toHaveBeenCalled();
+    expectOneRowPerMonth();
   });
 });
 
